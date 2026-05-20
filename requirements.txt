@@ -1,0 +1,5 @@
+playwright==1.44.0
+rapidfuzz==3.9.0
+supabase==2.5.0
+python-dotenv==1.0.1
+aiohttp==3.9.5

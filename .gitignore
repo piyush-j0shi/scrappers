@@ -1,0 +1,37 @@
+# Environment & secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Logs
+logs/
+*.log
+
+# Checkpoints & cache (runtime state, changes every run)
+.newworld_checkpoint.json
+.paknsave_checkpoint.json
+.foodstuffs_cache.json
+
+# Proxy lists (contain credentials/IPs)
+proxiesthatwork.txt
+proxy_test_results/
+
+# Store data (large JSON files, fetched at runtime)
+newworld_stores.json
+paknsave_stores.json
+woolworths_stores.json
+
+# Sessions & run state
+sessions/
+runs/
+
+# Misc
+.zip
+matching/
