@@ -444,6 +444,15 @@ class FoodstuffsScraper:
     async def _fetch_cf_clearance(self) -> None:
         """Use nodriver to pass Cloudflare Turnstile and cache the cf_clearance cookie."""
         import nodriver as uc
+        import nodriver.cdp.network as _cdn
+        # Chrome 147+ removed 'sameParty' from CDP Cookie — patch nodriver before use
+        try:
+            _orig_fj = _cdn.Cookie.from_json.__func__
+            _cdn.Cookie.from_json = classmethod(
+                lambda cls, j: _orig_fj(cls, {**j, "sameParty": j.get("sameParty", False)})
+            )
+        except Exception:
+            pass
         base_url = self.cfg["base_url"]
         probe_url = f"{base_url}/shop/category/fruit-and-vegetables"
         logger.info(f"[cf] launching nodriver to pass Turnstile on {base_url} ...")
@@ -457,14 +466,17 @@ class FoodstuffsScraper:
             for _ in range(20):
                 await asyncio.sleep(1)
                 title = await page.evaluate("document.title")
-                if "just a moment" not in title.lower():
+                if title and "just a moment" not in title.lower():
                     break
 
             # Capture the exact UA nodriver used — cf_clearance is bound to it
             self._cf_user_agent = await page.evaluate("navigator.userAgent")
             logger.info(f"[cf] nodriver UA: {self._cf_user_agent}")
 
-            all_cookies = await nd_browser.cookies.get_all()
+            try:
+                all_cookies = await asyncio.wait_for(nd_browser.cookies.get_all(), timeout=8)
+            except asyncio.TimeoutError:
+                all_cookies = await asyncio.wait_for(page.send(_cdn.get_all_cookies()), timeout=8)
             self._cf_cookies = [
                 {
                     "name": c.name,
@@ -845,8 +857,9 @@ class FoodstuffsScraper:
     # ---- Run --------------------------------------------------------------
 
     async def run(self) -> dict:
+        loop = asyncio.get_event_loop()
         await asyncio.sleep(random.uniform(0, 20))  # stagger worker starts to avoid simultaneous category hits
-        self._resolve_branch()
+        await loop.run_in_executor(None, self._resolve_branch)
         logger.info(
             f"chain={self.cfg['name']}  branch={self.branch_name}  "
             f"branch_id={self.branch_id}  api_store_id={self.api_store_id}"
@@ -916,7 +929,7 @@ class FoodstuffsScraper:
                 self.cache.save()  # persist after each branch run
 
             if not self.dry_run:
-                self._save_to_supabase(all_products, stats)
+                await loop.run_in_executor(None, self._save_to_supabase, all_products, stats)
             else:
                 logger.info("DRY RUN — skipping Supabase writes")
 
@@ -925,10 +938,10 @@ class FoodstuffsScraper:
                 else "partial" if stats["records_failed"]
                 else "success"
             )
-            self._end_run(run_id, status, stats)
+            await loop.run_in_executor(None, lambda: self._end_run(run_id, status, stats))
         except Exception as e:
             logger.exception("run failed")
-            self._end_run(run_id, "failed", stats, error=str(e))
+            await loop.run_in_executor(None, lambda: self._end_run(run_id, "failed", stats, error=str(e)))
             raise
         finally:
             await self._close_browser()
