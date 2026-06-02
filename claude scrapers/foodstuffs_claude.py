@@ -1300,7 +1300,11 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
     t0 = time.time()
 
     adaptive = AdaptiveSemaphore(max(1, args.concurrency), min_level=1)
-    logger.info(f"[adaptive] starting at concurrency={adaptive.current}")
+    # Scale block threshold proportionally with concurrency (base rate: 5 blocks per worker)
+    effective_block_threshold = max(ADAPTIVE_BLOCK_THRESHOLD,
+                                    ADAPTIVE_BLOCK_THRESHOLD * args.concurrency // 4)
+    logger.info(f"[adaptive] starting at concurrency={adaptive.current}  "
+                f"block_threshold={effective_block_threshold}")
     completed = 0
     total = len(branches)
     completed_lock = asyncio.Lock()
@@ -1314,7 +1318,7 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
         async with block_counter_lock:
             block_counter += 1
             overall["blocks"] += 1
-            if block_counter >= ADAPTIVE_BLOCK_THRESHOLD:
+            if block_counter >= effective_block_threshold:
                 block_counter = 0
                 old, new = adaptive.downgrade()
                 if old != new:
