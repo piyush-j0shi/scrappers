@@ -117,6 +117,25 @@ URL_TO_CATEGORY = {
     "meat-and-seafood-deals": "meat",
 }
 
+# Maps URL slug → Algolia category0SI display name used in the filters field.
+# Captured by running --filters-probe against a live branch.
+SLUG_TO_DISPLAY_NAME: dict[str, str] = {
+    "fruit-and-vegetables":       "Fruit & Vegetables",
+    "meat-poultry-and-seafood":   "Meat, Poultry & Seafood",
+    "fridge-deli-and-eggs":       "Fridge, Deli & Eggs",
+    "bakery":                     "Bakery",
+    "frozen":                     "Frozen",
+    "pantry":                     "Pantry",
+    "hot-and-cold-drinks":        "Hot & Cold Drinks",
+    "snacks-treats-and-easy-meals": "Snacks, Treats & Easy Meals",
+    "health-and-body":            "Health & Body",
+    "household-and-cleaning":     "Household & Cleaning",
+    "baby-and-toddler":           "Baby & Toddler",
+    "pets":                       "Pets",
+    "beer-wine-and-cider":        "Beer, Wine & Cider",
+    # meat-and-seafood-deals: display name not yet confirmed — falls back to browser
+}
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -499,6 +518,10 @@ class FoodstuffsScraper:
         self._api_post_data: Optional[dict] = None
         self._cf_cookies: list[dict] = []  # cf_clearance cookies from nodriver pre-step
         self._cf_user_agent: Optional[str] = None  # UA nodriver used to solve Turnstile
+        # Template saved after first successful browser category — reused for direct POSTs
+        self._direct_template: Optional[dict] = None
+        self._direct_headers: dict[str, str] = {}
+        self._direct_url: str = ""
 
     # ---- Browser / context ----------------------------------------------
 
@@ -783,7 +806,101 @@ class FoodstuffsScraper:
                 if p:
                     products.append(p)
         logger.info(f"    parsed {len(products)} products from {len(captured)} responses")
+
+        # Save template for direct-POST fast path after any successful browser category
+        if products and self._api_post_data and self._api_url and self._api_headers:
+            if not self._direct_template:
+                self._direct_template = copy.deepcopy(self._api_post_data)
+                self._direct_url = self._api_url
+                self._direct_headers = {k: v for k, v in self._api_headers.items()
+                                         if k.lower() not in ("host", "content-length")}
+
         return products, did_paginate
+
+    async def _scrape_category_direct(self, url: str) -> Optional[list[ScrapedProduct]]:
+        """Skip browser navigation — POST directly using the saved template.
+
+        Returns a product list on success, or None if a fallback to browser is needed.
+        """
+        if not self._direct_template or not self._direct_url or not self._direct_headers:
+            return None
+
+        slug = url.rstrip("/").split("/")[-1]
+        display_name = SLUG_TO_DISPLAY_NAME.get(slug)
+        if not display_name:
+            return None  # unknown slug — browser fallback
+
+        body = copy.deepcopy(self._direct_template)
+        alg = body.get("algoliaQuery")
+        if not alg or "filters" not in alg:
+            logger.warning(f"  [direct] {url} → algoliaQuery/filters missing in template — browser fallback")
+            return None
+        original_filters = alg["filters"]
+        alg["filters"] = re.sub(
+            r'category0SI:"[^"]*"',
+            f'category0SI:"{display_name}"',
+            original_filters,
+        )
+        if alg["filters"] == original_filters:
+            logger.warning(f"  [direct] {url} → category0SI not found in filters — browser fallback")
+            return None
+        body["page"] = 1
+
+        category = category_from_url(url)
+        try:
+            if self._rate_limiter:
+                await self._rate_limiter.acquire()
+            resp = await self._page.request.post(
+                self._direct_url, headers=self._direct_headers, data=body
+            )
+            if not resp.ok:
+                logger.warning(f"  [direct] {url} → HTTP {resp.status} — browser fallback")
+                return None
+            rj = await resp.json()
+        except Exception as e:
+            logger.warning(f"  [direct] {url} → {e} — browser fallback")
+            return None
+
+        total_pages = rj.get("totalPages") or 1
+        all_responses = [rj]
+
+        for page_num in range(2, total_pages + 1):
+            pb = copy.deepcopy(body)
+            pb["page"] = page_num
+            try:
+                if self._rate_limiter:
+                    await self._rate_limiter.acquire()
+                r2 = await self._page.request.post(
+                    self._direct_url, headers=self._direct_headers, data=pb
+                )
+                if r2.ok:
+                    all_responses.append(await r2.json())
+                else:
+                    logger.warning(f"  [direct] page {page_num}: HTTP {r2.status} — stopping")
+                    break
+            except Exception as e:
+                logger.warning(f"  [direct] page {page_num}: {e} — stopping")
+                break
+            await asyncio.sleep(0.4)
+
+        products: list[ScrapedProduct] = []
+        for data in all_responses:
+            items = (
+                data.get("products") or data.get("items")
+                or (data.get("pageProps") or {}).get("products") or []
+            )
+            for item in items:
+                p = self._parse_item(item, category)
+                if p:
+                    products.append(p)
+
+        if not products:
+            logger.warning(f"  [direct] {url} → 0 products — browser fallback")
+            return None
+
+        pages_label = f"{total_pages}p" if total_pages > 1 else ""
+        logger.info(f"  [direct] {url}  {len(products)} products {pages_label}".rstrip())
+        return products
 
     def _parse_item(self, item: dict, category: str) -> Optional[ScrapedProduct]:
         clean_name = item.get("name") or None
@@ -972,19 +1089,33 @@ class FoodstuffsScraper:
 
         await self._new_context()
         all_products: list[ScrapedProduct] = []
+        fast_categories = getattr(self, "_fast_categories", False)
         try:
             for url in random.sample(self.category_urls, len(self.category_urls)):
                 did_paginate = False
                 products: list[ScrapedProduct] = []
                 blocks_before = self.blocks
                 exc: Optional[Exception] = None
-                try:
-                    products, did_paginate = await self.scrape_one_category(url)
-                except Exception as e:
-                    exc = e
-                    logger.warning(f"category failed: {url}: {e}")
 
-                # Auto-recover: up to 2 retries with increasing back-off
+                # Fast path: direct POST (skip browser) if template is ready and flag is set
+                used_direct = False
+                if fast_categories and self._direct_template:
+                    try:
+                        direct_products = await self._scrape_category_direct(url)
+                        if direct_products is not None:
+                            products = direct_products
+                            used_direct = True
+                    except Exception as e:
+                        logger.warning(f"  [direct] {url} unexpected error: {e} — browser fallback")
+
+                if not used_direct:
+                    try:
+                        products, did_paginate = await self.scrape_one_category(url)
+                    except Exception as e:
+                        exc = e
+                        logger.warning(f"category failed: {url}: {e}")
+
+                # Auto-recover: up to 2 retries with increasing back-off (browser only)
                 blocked = self.blocks > blocks_before
                 for attempt in range(1, 3):
                     if not ((blocked or exc) and not products):
@@ -1018,7 +1149,8 @@ class FoodstuffsScraper:
                 all_products.extend(products)
                 if did_paginate:
                     await self._refresh_context()
-                await self._random_delay()
+                if not used_direct:
+                    await self._random_delay()
 
             stats["blocks"] = self.blocks
             logger.info(f"TOTAL scraped: {len(all_products)} products  blocks={self.blocks}")
@@ -1380,6 +1512,8 @@ def parse_args(argv: Optional[list[str]] = None, default_chain: Optional[str] = 
                     help="Number of branches to scrape in parallel (default 1)")
     ap.add_argument("--no-adaptive-drop", action="store_true", default=False,
                         help="Disable adaptive concurrency drop on 429 blocks (keep concurrency fixed)")
+    ap.add_argument("--fast-categories", action="store_true", default=False,
+                        help="Skip browser for categories 2-N per branch — direct POST reusing captured headers")
     ap.add_argument("--resume", action="store_true", default=False,
                     help="Skip branches already completed in a previous run (uses checkpoint file)")
     return ap.parse_args(argv)
@@ -1496,6 +1630,7 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
                 shared_browser=shared_browser,
                 rate_limiter=rate_limiter,
             )
+            scraper._fast_categories = getattr(args, "fast_categories", False)
             try:
                 stats = await scraper.run()
                 overall["branches"] += 1
