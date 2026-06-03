@@ -158,8 +158,8 @@ EXTRA_HEADERS = {
 STEALTH_SCRIPT = ""
 
 REQUEST_TIMEOUT_MS = 30_000
-DELAY_MIN = 3.0
-DELAY_MAX = 8.0
+DELAY_MIN = 1.0
+DELAY_MAX = 3.0
 ENRICH_CONCURRENCY_INITIAL = 12
 
 # Cloudflare page-title fragments that indicate a challenge/block
@@ -292,6 +292,126 @@ def _parse_proxy(url: str) -> dict:
     return out
 
 
+async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
+    """Open nodriver, pass Turnstile, return (cf_cookies, user_agent)."""
+    import nodriver as uc
+    import nodriver.cdp.network as _cdn
+    # Chrome 147+ removed 'sameParty' from CDP Cookie — patch before use
+    try:
+        _orig_fj = _cdn.Cookie.from_json.__func__
+        _cdn.Cookie.from_json = classmethod(
+            lambda cls, j: _orig_fj(cls, {**j, "sameParty": j.get("sameParty", False)})
+        )
+    except Exception:
+        pass
+    base_url = cfg["base_url"]
+    probe_url = f"{base_url}/shop/category/fruit-and-vegetables"
+    logger.info(f"[cf] launching nodriver to pass Turnstile on {base_url} ...")
+    nd_browser = None
+    cookies: list[dict] = []
+    user_agent: Optional[str] = None
+    try:
+        nd_browser = await uc.start(headless=False, browser_args=["--disable-http2", "--lang=en-NZ"])
+        page = await nd_browser.get(probe_url)
+        for _ in range(20):
+            await asyncio.sleep(1)
+            title = await page.evaluate("document.title")
+            if title and "just a moment" not in title.lower():
+                break
+        await asyncio.sleep(4)  # allow __cf_bm / _cfuvid to be written by CF JS
+        user_agent = await page.evaluate("navigator.userAgent")
+        logger.info(f"[cf] nodriver UA: {user_agent}")
+        try:
+            all_cookies = await asyncio.wait_for(nd_browser.cookies.get_all(), timeout=8)
+        except asyncio.TimeoutError:
+            all_cookies = await asyncio.wait_for(page.send(_cdn.get_all_cookies()), timeout=8)
+        cookies = [
+            {"name": c.name, "value": c.value, "domain": c.domain,
+             "path": c.path or "/", "secure": bool(c.secure), "httpOnly": bool(c.http_only)}
+            for c in all_cookies
+            if c.name in ("cf_clearance", "__cf_bm", "_cfuvid")
+        ]
+        if cookies:
+            logger.info(f"[cf] got {len(cookies)} CF cookies — Turnstile passed")
+        else:
+            logger.warning("[cf] no CF cookies — Turnstile may not have resolved")
+    except Exception as e:
+        logger.warning(f"[cf] nodriver failed: {e} — proceeding without CF clearance")
+    finally:
+        if nd_browser:
+            try:
+                nd_browser.stop()
+            except Exception:
+                pass
+    return cookies, user_agent
+
+
+class CfState:
+    """Shared CF clearance for all workers. Solve once; re-solve behind a lock on 403."""
+
+    def __init__(self) -> None:
+        self.cookies: list[dict] = []
+        self.user_agent: Optional[str] = None
+        self._lock = asyncio.Lock()
+        self._solved_at: float = 0.0
+
+    async def solve(self, cfg: dict) -> None:
+        self.cookies, self.user_agent = await _solve_cf_clearance(cfg)
+        self._solved_at = time.time()
+
+    async def ensure_fresh(self, cfg: dict) -> None:
+        """If another worker re-solved within 300s, reuse; otherwise re-solve."""
+        async with self._lock:
+            if self.cookies and (time.time() - self._solved_at) < 300:
+                logger.info("[cf-shared] reusing recent CF solve")
+                return
+            await self.solve(cfg)
+
+
+class TokenBucketLimiter:
+    """Token-bucket rate limiter: max `rate` req/s globally across all workers.
+    Also acts as a global 429 freeze: any worker that hits a 429 can pause all workers.
+    """
+
+    def __init__(self, rate: float, burst: Optional[int] = None) -> None:
+        self._rate = rate
+        self._tokens = float(burst or rate)
+        self._max = float(burst or rate)
+        self._lock = asyncio.Lock()
+        self._last = time.monotonic()
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()  # initially unpaused
+        self._pause_lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        was_paused = not self._pause_event.is_set()
+        await self._pause_event.wait()  # block if a 429 freeze is active
+        if was_paused:
+            await asyncio.sleep(random.uniform(0, 2))  # jitter only after a freeze
+        async with self._lock:
+            now = time.monotonic()
+            self._tokens = min(self._max, self._tokens + (now - self._last) * self._rate)
+            self._last = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+            else:
+                wait = (1.0 - self._tokens) / self._rate
+                await asyncio.sleep(wait)
+                self._tokens = 0.0
+                self._last = time.monotonic()
+
+    async def pause(self, seconds: int = 5) -> None:
+        """Freeze all workers for `seconds`. Only the first caller triggers the sleep."""
+        async with self._pause_lock:
+            if not self._pause_event.is_set():
+                return  # already paused by another worker
+            self._pause_event.clear()
+            logger.warning(f"[429-freeze] pausing ALL workers for {seconds}s ...")
+        await asyncio.sleep(seconds)
+        logger.info("[429-freeze] resuming all workers")
+        self._pause_event.set()
+
+
 # ---------------------------------------------------------------------------
 # Persistent productId→barcode cache
 # ---------------------------------------------------------------------------
@@ -340,6 +460,9 @@ class FoodstuffsScraper:
         cache: Optional[BarcodeCache] = None,
         proxy_url: Optional[str] = None,
         on_block: Optional[callable] = None,  # async callback called immediately on each block
+        cf_state: Optional[CfState] = None,
+        shared_browser: Optional[Browser] = None,
+        rate_limiter: Optional[TokenBucketLimiter] = None,
     ) -> None:
         if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
             raise RuntimeError(f"Missing Supabase env in {ENV_PATH}")
@@ -362,6 +485,9 @@ class FoodstuffsScraper:
         self.cache = cache if cache is not None else BarcodeCache()
         self.proxy_url = proxy_url
         self.on_block = on_block  # called as await on_block() on every block detection
+        self._cf_state = cf_state
+        self._shared_browser = shared_browser
+        self._rate_limiter = rate_limiter
 
         self._playwright = None
         self._browser: Optional[Browser] = None
@@ -442,65 +568,7 @@ class FoodstuffsScraper:
             await self._playwright.stop()
 
     async def _fetch_cf_clearance(self) -> None:
-        """Use nodriver to pass Cloudflare Turnstile and cache the cf_clearance cookie."""
-        import nodriver as uc
-        import nodriver.cdp.network as _cdn
-        # Chrome 147+ removed 'sameParty' from CDP Cookie — patch nodriver before use
-        try:
-            _orig_fj = _cdn.Cookie.from_json.__func__
-            _cdn.Cookie.from_json = classmethod(
-                lambda cls, j: _orig_fj(cls, {**j, "sameParty": j.get("sameParty", False)})
-            )
-        except Exception:
-            pass
-        base_url = self.cfg["base_url"]
-        probe_url = f"{base_url}/shop/category/fruit-and-vegetables"
-        logger.info(f"[cf] launching nodriver to pass Turnstile on {base_url} ...")
-        nd_browser = None
-        try:
-            nd_browser = await uc.start(
-                headless=False,
-                browser_args=["--disable-http2", "--lang=en-NZ"],
-            )
-            page = await nd_browser.get(probe_url)
-            for _ in range(20):
-                await asyncio.sleep(1)
-                title = await page.evaluate("document.title")
-                if title and "just a moment" not in title.lower():
-                    break
-
-            # Capture the exact UA nodriver used — cf_clearance is bound to it
-            self._cf_user_agent = await page.evaluate("navigator.userAgent")
-            logger.info(f"[cf] nodriver UA: {self._cf_user_agent}")
-
-            try:
-                all_cookies = await asyncio.wait_for(nd_browser.cookies.get_all(), timeout=8)
-            except asyncio.TimeoutError:
-                all_cookies = await asyncio.wait_for(page.send(_cdn.get_all_cookies()), timeout=8)
-            self._cf_cookies = [
-                {
-                    "name": c.name,
-                    "value": c.value,
-                    "domain": c.domain,
-                    "path": c.path or "/",
-                    "secure": bool(c.secure),
-                    "httpOnly": bool(c.http_only),
-                }
-                for c in all_cookies
-                if c.name in ("cf_clearance", "__cf_bm", "_cfuvid")
-            ]
-            if self._cf_cookies:
-                logger.info(f"[cf] got {len(self._cf_cookies)} CF cookies — Turnstile passed")
-            else:
-                logger.warning("[cf] no CF cookies — Turnstile may not have resolved")
-        except Exception as e:
-            logger.warning(f"[cf] nodriver failed: {e} — proceeding without CF clearance")
-        finally:
-            if nd_browser:
-                try:
-                    nd_browser.stop()
-                except Exception:
-                    pass
+        self._cf_cookies, self._cf_user_agent = await _solve_cf_clearance(self.cfg)
 
     # ---- Branch resolution ----------------------------------------------
 
@@ -595,11 +663,25 @@ class FoodstuffsScraper:
 
         try:
             await self._random_delay()
+            if self._rate_limiter:
+                await self._rate_limiter.acquire()
             nav_resp = await self._page.goto(url, wait_until="load", timeout=60_000)
             # Cloudflare block detection
             if nav_resp and nav_resp.status in (403, 429, 503):
                 self.blocks += 1
                 logger.warning(f"  [block] HTTP {nav_resp.status} on {url} — Cloudflare block")
+                if nav_resp.status == 429:
+                    headers = dict(nav_resp.headers)
+                    retry_after = headers.get("retry-after") or headers.get("x-ratelimit-reset")
+                    rate_limit = headers.get("x-ratelimit-limit")
+                    remaining = headers.get("x-ratelimit-remaining")
+                    logger.warning(
+                        f"  [429] retry-after={retry_after}  limit={rate_limit}  remaining={remaining}  "
+                        f"all-headers={list(headers.keys())}"
+                    )
+                    pause_secs = min(int(retry_after), 5) if retry_after and retry_after.isdigit() else 5
+                    if self._rate_limiter:
+                        asyncio.create_task(self._rate_limiter.pause(pause_secs))
                 if self.on_block:
                     try:
                         await self.on_block()
@@ -639,6 +721,8 @@ class FoodstuffsScraper:
                                if k.lower() not in ("host", "content-length")}
                     body = copy.deepcopy(self._api_post_data); body["page"] = 1
                     try:
+                        if self._rate_limiter:
+                            await self._rate_limiter.acquire()
                         resp = await self._page.request.post(self._api_url, headers=headers, data=body)
                         if resp.ok:
                             captured.append({"url": self._api_url, "data": await resp.json()})
@@ -661,6 +745,8 @@ class FoodstuffsScraper:
                 for page_num in range(2, total_pages + 1):
                     try:
                         body = copy.deepcopy(self._api_post_data); body["page"] = page_num
+                        if self._rate_limiter:
+                            await self._rate_limiter.acquire()
                         resp = await self._page.request.post(self._api_url, headers=headers, data=body)
                         if resp.ok:
                             captured.append({"url": self._api_url, "data": await resp.json()})
@@ -858,7 +944,7 @@ class FoodstuffsScraper:
 
     async def run(self) -> dict:
         loop = asyncio.get_event_loop()
-        await asyncio.sleep(random.uniform(0, 20))  # stagger worker starts to avoid simultaneous category hits
+        await asyncio.sleep(random.uniform(0, 15))  # stagger workers across full branch cycle
         await loop.run_in_executor(None, self._resolve_branch)
         logger.info(
             f"chain={self.cfg['name']}  branch={self.branch_name}  "
@@ -870,8 +956,20 @@ class FoodstuffsScraper:
                  "price_changes": 0, "barcodes_from_cache": 0, "barcodes_fetched": 0,
                  "blocks": 0}
 
-        await self._fetch_cf_clearance()
-        await self._start_browser()
+        # CF solve: use shared state if available (solves once for all workers)
+        if self._cf_state:
+            await self._cf_state.ensure_fresh(self.cfg)
+            self._cf_cookies = list(self._cf_state.cookies)
+            self._cf_user_agent = self._cf_state.user_agent
+        else:
+            await self._fetch_cf_clearance()
+
+        # Browser: use shared instance if available (workers only create contexts)
+        if self._shared_browser:
+            self._browser = self._shared_browser
+        else:
+            await self._start_browser()
+
         await self._new_context()
         all_products: list[ScrapedProduct] = []
         try:
@@ -893,12 +991,17 @@ class FoodstuffsScraper:
                         break
                     reason = "block" if blocked else f"error: {exc}"
                     logger.warning(f"  [retry {attempt}] category {url} ({reason}) — re-fetching CF clearance + refreshing context")
-                    await self._fetch_cf_clearance()
+                    if self._cf_state:
+                        await self._cf_state.ensure_fresh(self.cfg)
+                        self._cf_cookies = list(self._cf_state.cookies)
+                        self._cf_user_agent = self._cf_state.user_agent
+                    else:
+                        await self._fetch_cf_clearance()
                     try:
                         await self._refresh_context()
                     except Exception as e:
                         logger.warning(f"  [retry {attempt}] context refresh failed: {e}")
-                    await asyncio.sleep(random.uniform(4 * attempt, 9 * attempt))  # longer back-off each attempt
+                    await asyncio.sleep(random.uniform(4 * attempt, 9 * attempt))
                     exc = None
                     blocks_before = self.blocks
                     try:
@@ -944,7 +1047,24 @@ class FoodstuffsScraper:
             await loop.run_in_executor(None, lambda: self._end_run(run_id, "failed", stats, error=str(e)))
             raise
         finally:
-            await self._close_browser()
+            if self._shared_browser:
+                # Shared browser: only close this worker's context, not the browser
+                if self._page:
+                    try:
+                        await self._page.unroute_all(behavior="ignoreErrors")
+                    except Exception:
+                        pass
+                    try:
+                        await self._page.close()
+                    except Exception:
+                        pass
+                if self._context:
+                    try:
+                        await self._context.close()
+                    except Exception:
+                        pass
+            else:
+                await self._close_browser()
         return stats
 
     # ---- Supabase writes (mirrors woolworths_claude.py) -----------------
@@ -1258,6 +1378,8 @@ def parse_args(argv: Optional[list[str]] = None, default_chain: Optional[str] = 
                     help="Proxy URL (e.g. http://USER:PASS@host:port). Browser + API calls route through it.")
     ap.add_argument("--concurrency", type=int, default=1,
                     help="Number of branches to scrape in parallel (default 1)")
+    ap.add_argument("--no-adaptive-drop", action="store_true", default=False,
+                        help="Disable adaptive concurrency drop on 429 blocks (keep concurrency fixed)")
     ap.add_argument("--resume", action="store_true", default=False,
                     help="Skip branches already completed in a previous run (uses checkpoint file)")
     return ap.parse_args(argv)
@@ -1308,6 +1430,23 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
     elif not args.resume and checkpoint_file.exists():
         checkpoint_file.unlink()
 
+    # Solve CF once — shared across all workers
+    cf_state = CfState()
+    await cf_state.solve(cfg)
+
+    # Single shared browser — workers create lightweight contexts only
+    playwright_instance = await async_playwright().start()
+    launch_kwargs: dict = {
+        "headless": headless,
+        "args": ["--disable-http2", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    }
+    if args.proxy:
+        launch_kwargs["proxy"] = _parse_proxy(args.proxy)
+    shared_browser = await playwright_instance.chromium.launch(**launch_kwargs)
+
+    # Global rate limiter: 4 req/sec max across all workers
+    rate_limiter = TokenBucketLimiter(rate=4.0, burst=4)
+
     overall = {"branches": 0, "updated": 0, "new": 0, "failed": 0, "price_changes": 0,
                "cache_hits": 0, "fetched": 0, "blocks": 0}
     t0 = time.time()
@@ -1331,7 +1470,7 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
         async with block_counter_lock:
             block_counter += 1
             overall["blocks"] += 1
-            if block_counter >= effective_block_threshold:
+            if not args.no_adaptive_drop and block_counter >= effective_block_threshold:
                 block_counter = 0
                 old, new = adaptive.downgrade()
                 if old != new:
@@ -1353,6 +1492,9 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
                 cache=cache,
                 proxy_url=args.proxy,
                 on_block=on_block_fired,
+                cf_state=cf_state,
+                shared_browser=shared_browser,
+                rate_limiter=rate_limiter,
             )
             try:
                 stats = await scraper.run()
@@ -1381,7 +1523,11 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
                     f"({(completed/total*100):.1f}%)  conc={adaptive.current} ==="
                 )
 
-    await asyncio.gather(*[run_one(b) for b in branches], return_exceptions=True)
+    try:
+        await asyncio.gather(*[run_one(b) for b in branches], return_exceptions=True)
+    finally:
+        await shared_browser.close()
+        await playwright_instance.stop()
 
     cache.save()
     dt = time.time() - t0
