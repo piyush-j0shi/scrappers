@@ -241,6 +241,8 @@ ASSET_BLOCK_RE = re.compile(
     re.I,
 )
 
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logging.getLogger("httpx").setLevel(logging.WARNING)  # suppress Supabase HTTP request logs
 logger = logging.getLogger("foodstuffs_claude")
@@ -995,7 +997,7 @@ class FoodstuffsScraper:
             i = 0
             assert self._page
             headers = {
-                k: v for k, v in self._api_headers.items()
+                k: v for k, v in (self._api_headers or self._direct_headers).items()
                 if k.lower() not in ("host", "content-length")
             }
             t0 = time.time()
@@ -1486,7 +1488,6 @@ class FoodstuffsScraper:
             logger.warning(f"insert by name failed for '{p.raw_name}': {e}")
             return None, False
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1658,9 +1659,21 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
                     f"({(completed/total*100):.1f}%)  conc={adaptive.current} ==="
                 )
 
+    async def _periodic_cf_refresh():
+        while True:
+            await asyncio.sleep(25 * 60)
+            logger.info("[cf-refresh] proactive CF clearance re-solve (25-min interval) ...")
+            await cf_state.solve(cfg)
+
+    refresh_task = asyncio.create_task(_periodic_cf_refresh())
     try:
         await asyncio.gather(*[run_one(b) for b in branches], return_exceptions=True)
     finally:
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
         await shared_browser.close()
         await playwright_instance.stop()
 

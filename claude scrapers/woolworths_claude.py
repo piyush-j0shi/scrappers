@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
@@ -299,12 +300,15 @@ class WoolworthsClaudeScraper:
         self.proxy_url = proxy_url
         self.auto_bootstrap = auto_bootstrap
         self.max_session_age_min = max_session_age_min
+        self.fast_categories: bool = False
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._api_headers: dict[str, str] = {}
         self._api_paginated_url: str = ""
+        self._fast_template_url: Optional[str] = None
+        self._fast_headers: dict[str, str] = {}
 
     # ---- Browser setup ---------------------------------------------------
 
@@ -589,6 +593,15 @@ class WoolworthsClaudeScraper:
             if total_items:
                 logger.info(f"    pagination: {total_items} items / page_size={page_size} → {total_pages} pages")
 
+            # Save API template for --fast-categories on first successful browser capture.
+            if not self._fast_template_url and self._api_paginated_url and self._api_headers:
+                self._fast_template_url = self._api_paginated_url
+                self._fast_headers = {
+                    k: v for k, v in self._api_headers.items()
+                    if k.lower() not in ("host", "content-length")
+                }
+                logger.info(f"  [fast] template captured: {self._fast_template_url[:120]}")
+
             # Direct-API pagination using captured headers.
             if total_pages > 1 and self._api_paginated_url and self._api_headers:
                 did_paginate = True
@@ -647,6 +660,90 @@ class WoolworthsClaudeScraper:
 
         logger.info(f"    parsed {len(products)} products from {len(captured)} responses")
         return products, did_paginate, len(captured)
+
+    async def _scrape_category_direct(self, url: str) -> Optional[list[ScrapedProduct]]:
+        """Skip browser nav — substitute slug in captured API template and paginate directly.
+
+        Returns None on any failure so the caller falls back to the browser path.
+        """
+        if not self._fast_template_url or not self._fast_headers:
+            return None
+        slug = url.rstrip("/").split("/")[-1]
+        # Reset to page 1 and substitute the category slug in the dasFilter param.
+        base = re.sub(r"\bpage=\d+\b", "page=1", self._fast_template_url)
+        direct_url = re.sub(
+            r"dasFilter=Department%3[Bb]%3[Bb][^%&]+%3[Bb]false",
+            f"dasFilter=Department%3B%3B{quote(slug)}%3Bfalse",
+            base,
+            flags=re.IGNORECASE,
+        )
+        if direct_url == base:
+            logger.warning(f"  [fast] could not substitute '{slug}' in template — browser fallback")
+            return None
+
+        category = category_from_url(url)
+        try:
+            resp = await self._page.request.get(direct_url, headers=self._fast_headers)
+            if not resp.ok:
+                logger.warning(f"  [fast] HTTP {resp.status} for {slug} — browser fallback")
+                return None
+            data = await resp.json()
+        except Exception as e:
+            logger.warning(f"  [fast] {e} — browser fallback")
+            return None
+
+        products_node = data.get("products") or {}
+        total_items = 0
+        page_size = 48
+        if isinstance(products_node, dict):
+            total_items = products_node.get("totalItems") or 0
+            page_size = data.get("currentPageSize") or 48
+        total_pages = math.ceil(total_items / page_size) if total_items else 1
+
+        all_data = [data]
+        for page_num in range(2, total_pages + 1):
+            page_url = re.sub(r"\bpage=\d+\b", f"page={page_num}", direct_url)
+            try:
+                r2 = await self._page.request.get(page_url, headers=self._fast_headers)
+                if r2.ok:
+                    all_data.append(await r2.json())
+                elif r2.status == 500:
+                    await asyncio.sleep(3)
+                    r3 = await self._page.request.get(page_url, headers=self._fast_headers)
+                    if r3.ok:
+                        all_data.append(await r3.json())
+                    else:
+                        logger.warning(f"  [fast] page {page_num}: HTTP {r3.status} after retry — stopping")
+                        break
+                else:
+                    logger.warning(f"  [fast] page {page_num}: HTTP {r2.status} — stopping")
+                    break
+            except Exception as e:
+                logger.warning(f"  [fast] page {page_num}: {e} — stopping")
+                break
+            await asyncio.sleep(0.4)
+
+        products: list[ScrapedProduct] = []
+        for d in all_data:
+            pn = d.get("products")
+            if isinstance(pn, dict):
+                items = pn.get("items") or []
+            elif isinstance(pn, list):
+                items = pn
+            else:
+                items = d.get("items") or []
+            for item in items:
+                p = self._parse_item(item, category)
+                if p:
+                    products.append(p)
+
+        if not products:
+            logger.warning(f"  [fast] {url} → 0 products — browser fallback")
+            return None
+
+        pages_label = f"{total_pages}p" if total_pages > 1 else ""
+        logger.info(f"  [fast] {url}  {len(products)} products {pages_label}".rstrip())
+        return products
 
     def _parse_item(self, item: dict, category: str) -> Optional[ScrapedProduct]:
         if item.get("type") != "Product":
@@ -741,60 +838,73 @@ class WoolworthsClaudeScraper:
                 did_paginate = False
                 products: list[ScrapedProduct] = []
                 num_responses = 0
-                try:
-                    products, did_paginate, num_responses = await self.scrape_one_category(url)
-                except Exception as e:
-                    logger.warning(f"category failed: {url}: {e}")
+                used_fast = False
 
-                # Block detection: 3 signals, any one triggers recovery
-                #   1. Visible challenge page (Akamai/Cloudflare HTML)  — `_is_block_signal`
-                #   2. Silent challenge: 0 products AND 0 captured XHRs — page loaded but JS suppressed
-                #   3. Empty result with no responses = same as #2
-                # Recovery depends on whether we're proxying:
-                #   - No proxy: re-bootstrap from home IP (fresh session) and retry
-                #   - Proxy:    refresh context + slight delay + retry once (proxy stays the same;
-                #               new TLS handshake + jitter usually carries enough trust to pass)
-                silent_block = (not products) and (num_responses == 0)
-                visible_block = False
-                if (not products) and session_path:
+                # Fast path: skip browser nav if template is captured and flag is set.
+                if self.fast_categories and self._fast_template_url:
                     try:
-                        title = await self._page.title()
-                        body = await self._page.evaluate(
-                            "document.body ? document.body.innerText.substring(0, 500) : ''"
-                        )
-                        visible_block = _is_block_signal(title, body)
-                    except Exception:
-                        pass
+                        fast_prods = await self._scrape_category_direct(url)
+                        if fast_prods is not None:
+                            products = fast_prods
+                            used_fast = True
+                    except Exception as e:
+                        logger.warning(f"  [fast] unexpected error: {e} — browser fallback")
 
-                if (silent_block or visible_block) and self.auto_bootstrap and session_path:
-                    stats["blocks_detected"] += 1
-                    label = "visible challenge" if visible_block else "silent challenge (0 XHRs captured)"
-                    if self.proxy_url:
-                        logger.warning(f"  [block] {label} on {url} (proxy in use) — refresh+jitter+retry")
-                        await self._refresh_context()
-                        # Jitter delay so Akamai doesn't see a tight repeat
-                        await asyncio.sleep(random.uniform(5.0, 12.0))
-                    else:
-                        logger.warning(f"  [block] {label} on {url} — re-bootstrap+retry")
-                        ok = await asyncio.get_event_loop().run_in_executor(
-                            None, self._bootstrap_session_sync
-                        )
-                        if ok:
-                            await self._refresh_context()
+                if not used_fast:
                     try:
                         products, did_paginate, num_responses = await self.scrape_one_category(url)
-                        stats["retries"] += 1
-                        if products:
-                            logger.info(f"  [block] retry succeeded ({len(products)} products)")
-                        else:
-                            logger.warning(f"  [block] retry STILL empty ({num_responses} XHRs) — moving on")
                     except Exception as e:
-                        logger.warning(f"  retry failed: {e}")
+                        logger.warning(f"category failed: {url}: {e}")
+
+                    # Block detection: 3 signals, any one triggers recovery
+                    #   1. Visible challenge page (Akamai/Cloudflare HTML)  — `_is_block_signal`
+                    #   2. Silent challenge: 0 products AND 0 captured XHRs — page loaded but JS suppressed
+                    #   3. Empty result with no responses = same as #2
+                    # Recovery depends on whether we're proxying:
+                    #   - No proxy: re-bootstrap from home IP (fresh session) and retry
+                    #   - Proxy:    refresh context + slight delay + retry once (proxy stays the same;
+                    #               new TLS handshake + jitter usually carries enough trust to pass)
+                    silent_block = (not products) and (num_responses == 0)
+                    visible_block = False
+                    if (not products) and session_path:
+                        try:
+                            title = await self._page.title()
+                            body = await self._page.evaluate(
+                                "document.body ? document.body.innerText.substring(0, 500) : ''"
+                            )
+                            visible_block = _is_block_signal(title, body)
+                        except Exception:
+                            pass
+
+                    if (silent_block or visible_block) and self.auto_bootstrap and session_path:
+                        stats["blocks_detected"] += 1
+                        label = "visible challenge" if visible_block else "silent challenge (0 XHRs captured)"
+                        if self.proxy_url:
+                            logger.warning(f"  [block] {label} on {url} (proxy in use) — refresh+jitter+retry")
+                            await self._refresh_context()
+                            await asyncio.sleep(random.uniform(5.0, 12.0))
+                        else:
+                            logger.warning(f"  [block] {label} on {url} — re-bootstrap+retry")
+                            ok = await asyncio.get_event_loop().run_in_executor(
+                                None, self._bootstrap_session_sync
+                            )
+                            if ok:
+                                await self._refresh_context()
+                        try:
+                            products, did_paginate, num_responses = await self.scrape_one_category(url)
+                            stats["retries"] += 1
+                            if products:
+                                logger.info(f"  [block] retry succeeded ({len(products)} products)")
+                            else:
+                                logger.warning(f"  [block] retry STILL empty ({num_responses} XHRs) — moving on")
+                        except Exception as e:
+                            logger.warning(f"  retry failed: {e}")
+
+                    if did_paginate:
+                        await self._refresh_context()
+                    await self._random_delay()
 
                 all_products.extend(products)
-                if did_paginate:
-                    await self._refresh_context()
-                await self._random_delay()
             logger.info(f"TOTAL scraped: {len(all_products)} products")
             self._update_run(run_id, total_scraped=len(all_products))
 
@@ -1173,6 +1283,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--skip-recently-done", type=float, default=0.0,
                     help="If >0, query scraper_runs and skip branches with status=success "
                          "in the last N hours. Use to resume after a partial run.")
+    ap.add_argument("--fast-categories", action="store_true",
+                    help="After the first category captures the API template, skip browser "
+                         "navigation for all remaining categories and call the API directly. "
+                         "~4-5x faster per branch.")
     return ap.parse_args()
 
 
@@ -1270,6 +1384,7 @@ async def main_async() -> int:
                 auto_bootstrap=auto_bootstrap,
                 max_session_age_min=args.max_session_age,
             )
+            scraper.fast_categories = args.fast_categories
             try:
                 stats = await scraper.run()
                 overall["branches"] += 1
