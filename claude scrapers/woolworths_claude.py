@@ -175,6 +175,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("woolworths_claude")
 
+_log_dir = Path(__file__).parent / "logs"
+_log_dir.mkdir(exist_ok=True)
+
+def _setup_file_logging() -> None:
+    from datetime import date
+    log_file = _log_dir / f"woolworths_{date.today()}.log"
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+    logging.getLogger().addHandler(fh)
+    logger.info(f"logging to {log_file}")
+
 # ---------------------------------------------------------------------------
 # Data class
 # ---------------------------------------------------------------------------
