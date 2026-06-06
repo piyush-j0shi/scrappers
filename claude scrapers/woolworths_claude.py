@@ -921,7 +921,8 @@ class WoolworthsClaudeScraper:
             self._update_run(run_id, total_scraped=len(all_products))
 
             if not self.dry_run:
-                self._save_to_supabase(all_products, stats)
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self._save_to_supabase, all_products, stats)
             else:
                 logger.info("DRY RUN — skipping Supabase writes")
 
@@ -1314,6 +1315,7 @@ def categories_for(args: argparse.Namespace) -> list[str]:
 
 async def main_async() -> int:
     args = parse_args()
+    _setup_file_logging()
     if args.proxy and args.proxy_file:
         logger.error("--proxy and --proxy-file are mutually exclusive")
         return 2
