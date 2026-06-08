@@ -713,27 +713,34 @@ class WoolworthsClaudeScraper:
         total_pages = math.ceil(total_items / page_size) if total_items else 1
 
         all_data = [data]
-        for page_num in range(2, total_pages + 1):
-            page_url = re.sub(r"\bpage=\d+\b", f"page={page_num}", direct_url)
-            try:
-                r2 = await self._page.request.get(page_url, headers=self._fast_headers)
-                if r2.ok:
-                    all_data.append(await r2.json())
-                elif r2.status == 500:
-                    await asyncio.sleep(3)
-                    r3 = await self._page.request.get(page_url, headers=self._fast_headers)
-                    if r3.ok:
-                        all_data.append(await r3.json())
-                    else:
-                        logger.warning(f"  [fast] page {page_num}: HTTP {r3.status} after retry — stopping")
-                        break
-                else:
-                    logger.warning(f"  [fast] page {page_num}: HTTP {r2.status} — stopping")
-                    break
-            except Exception as e:
-                logger.warning(f"  [fast] page {page_num}: {e} — stopping")
-                break
-            await asyncio.sleep(0.4)
+        if total_pages > 1:
+            _sem = asyncio.Semaphore(3)
+
+            async def _fetch_page(page_num: int) -> tuple[int, Optional[dict]]:
+                page_url = re.sub(r"\bpage=\d+\b", f"page={page_num}", direct_url)
+                async with _sem:
+                    try:
+                        r = await self._page.request.get(page_url, headers=self._fast_headers)
+                        if r.ok:
+                            return page_num, await r.json()
+                        if r.status == 500:
+                            await asyncio.sleep(3)
+                            r2 = await self._page.request.get(page_url, headers=self._fast_headers)
+                            if r2.ok:
+                                return page_num, await r2.json()
+                            logger.warning(f"  [fast] page {page_num}: HTTP {r2.status} after retry")
+                        else:
+                            logger.warning(f"  [fast] page {page_num}: HTTP {r.status}")
+                    except Exception as e:
+                        logger.warning(f"  [fast] page {page_num}: {e}")
+                return page_num, None
+
+            page_results = await asyncio.gather(
+                *[_fetch_page(p) for p in range(2, total_pages + 1)]
+            )
+            for _, page_data in sorted(page_results, key=lambda x: x[0]):
+                if page_data is not None:
+                    all_data.append(page_data)
 
         products: list[ScrapedProduct] = []
         for d in all_data:
