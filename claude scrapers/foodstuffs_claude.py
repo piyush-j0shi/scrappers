@@ -1362,7 +1362,46 @@ class FoodstuffsScraper:
 
         sp_rows = list({r["product_id"]: r for r in sp_rows}.values())
 
+        # Snapshot existing prices BEFORE the upsert.
+        # Supabase upsert returns post-update values, so reading current_price from the
+        # upsert response always equals the new price — diff is always 0. Pre-fetching
+        # gives us the genuine old price to compare against.
+        existing_map: dict[str, dict] = {}
+        if self.branch_id:
+            page_size = 1000
+            offset = 0
+            try:
+                while True:
+                    r = (self.supabase.table("store_products")
+                         .select("id,product_id,current_price,unit_price")
+                         .eq("store_id", self.branch_id)
+                         .range(offset, offset + page_size - 1)
+                         .execute())
+                    for row in r.data:
+                        existing_map[row["product_id"]] = row
+                    if len(r.data) < page_size:
+                        break
+                    offset += page_size
+            except Exception as e:
+                logger.warning(f"could not fetch store_products snapshot: {e}")
+
         ph_rows: list[dict] = []
+        for product_id, effective in new_price_map.items():
+            existing = existing_map.get(product_id)
+            if existing and existing.get("current_price") is not None:
+                old_price = float(existing["current_price"])
+                if abs(old_price - effective) > 0.001:
+                    ph_rows.append({
+                        "store_product_id": existing["id"],
+                        "old_price": old_price,
+                        "new_price": effective,
+                        "old_unit_price": existing.get("unit_price"),
+                        "new_unit_price": None,
+                    })
+                    stats["price_changes"] += 1
+
+        ph_rows = list({r["store_product_id"]: r for r in ph_rows}.values())
+
         total = 0
         for i in range(0, len(sp_rows), CHUNK):
             chunk = sp_rows[i : i + CHUNK]
@@ -1371,20 +1410,6 @@ class FoodstuffsScraper:
                     chunk, on_conflict="product_id,store_id"
                 ).execute()
                 total += len(r.data)
-                for row in (r.data or []):
-                    pid = row.get("product_id")
-                    old_price = row.get("current_price")
-                    new_price = new_price_map.get(pid)
-                    if old_price is not None and new_price is not None:
-                        if abs(float(old_price) - new_price) > 0.001:
-                            ph_rows.append({
-                                "store_product_id": row["id"],
-                                "old_price": float(old_price),
-                                "new_price": new_price,
-                                "old_unit_price": row.get("unit_price"),
-                                "new_unit_price": None,
-                            })
-                            stats["price_changes"] += 1
             except Exception as e:
                 logger.error(f"store_products upsert chunk {i // CHUNK + 1}: {e}")
                 stats["records_failed"] += len(chunk)
@@ -1392,7 +1417,6 @@ class FoodstuffsScraper:
         logger.info(f"upserted {total} store_products rows")
 
         if ph_rows:
-            ph_rows = list({r["store_product_id"]: r for r in ph_rows}.values())
             for i in range(0, len(ph_rows), CHUNK):
                 chunk = ph_rows[i : i + CHUNK]
                 try:
