@@ -199,6 +199,7 @@ class AdaptiveSemaphore:
 
     def __init__(self, initial: int, min_level: int = 1) -> None:
         self._target = max(min_level, initial)
+        self._max = self._target
         self._min = min_level
         self._active = 0
         self._cond = asyncio.Condition(asyncio.Lock())
@@ -231,6 +232,15 @@ class AdaptiveSemaphore:
         if self._target > self._min:
             self._target -= 1
         return old, self._target
+
+    async def upgrade(self) -> tuple[int, int]:
+        """Restore target to original max. Returns (old, new). No-op if already at max."""
+        async with self._cond:
+            old = self._target
+            if self._target < self._max:
+                self._target = self._max
+                self._cond.notify_all()
+            return old, self._target
 ENRICH_CONCURRENCY_MIN = 1
 ENRICH_429_THRESHOLD = 3   # consecutive 429s before downscale
 BARCODE_API = "https://api-prod.newworld.co.nz/v1/edge/store/{store_id}/product/{pid}"
@@ -1074,7 +1084,7 @@ class FoodstuffsScraper:
         run_id = self._start_run()
         stats = {"records_updated": 0, "records_failed": 0, "new_products": 0,
                  "price_changes": 0, "barcodes_from_cache": 0, "barcodes_fetched": 0,
-                 "blocks": 0}
+                 "blocks": 0, "categories_failed": 0}
 
         # CF solve: use shared state if available (solves once for all workers)
         if self._cf_state:
@@ -1150,6 +1160,7 @@ class FoodstuffsScraper:
                         logger.warning(f"  [retry {attempt}] failed: {e}")
 
                 if not products:
+                    stats["categories_failed"] += 1
                     _cat_name = url.split("/category/")[-1]
                     _ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                     _reason = (
@@ -1647,12 +1658,15 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
     block_counter = 0  # cumulative blocks across all branches
     block_counter_lock = asyncio.Lock()
     overall["blocks"] = 0  # ensure counter is set before any callback
+    clean_branches = 0  # consecutive successful branches since last block/downgrade
+    upgrade_threshold = 5  # clean branches needed to restore full concurrency
 
     async def on_block_fired() -> None:
         """Immediate-downgrade callback: react to blocks while branches are in flight."""
-        nonlocal block_counter
+        nonlocal block_counter, clean_branches
         async with block_counter_lock:
             block_counter += 1
+            clean_branches = 0  # reset recovery counter on any block
             overall["blocks"] += 1
             if not args.no_adaptive_drop and block_counter >= effective_block_threshold:
                 block_counter = 0
@@ -1664,7 +1678,7 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
                     )
 
     async def run_one(b: dict) -> None:
-        nonlocal completed
+        nonlocal completed, clean_branches
         async with adaptive:
             scraper = FoodstuffsScraper(
                 chain_key=args.chain,
@@ -1690,8 +1704,22 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
                 overall["price_changes"] += stats["price_changes"]
                 overall["cache_hits"] += stats.get("barcodes_from_cache", 0)
                 overall["fetched"] += stats.get("barcodes_fetched", 0)
-                # Save checkpoint after successful branch
-                if b.get("id"):
+                # Recover concurrency after enough clean branches
+                if not args.no_adaptive_drop:
+                    async with block_counter_lock:
+                        clean_branches += 1
+                        if clean_branches >= upgrade_threshold:
+                            clean_branches = 0
+                            old, new = await adaptive.upgrade()
+                            if old != new:
+                                logger.info(
+                                    f"[adaptive] {upgrade_threshold} clean branches — "
+                                    f"recovering concurrency {old} -> {new}"
+                                )
+                # Only checkpoint if branch had no empty categories — records_failed includes
+                # normal unresolvable products so don't use it as a disqualifier
+                branch_clean = stats["categories_failed"] == 0
+                if b.get("id") and branch_clean:
                     completed_ids.add(b["id"])
                     try:
                         checkpoint_file.write_text(json.dumps(list(completed_ids)))
