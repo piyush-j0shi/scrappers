@@ -46,6 +46,7 @@ from dotenv import load_dotenv
 # from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from patchright.async_api import async_playwright, Browser, BrowserContext, Page
 from supabase import create_client, Client
+from notify import push
 
 # ---------------------------------------------------------------------------
 # Paths & env
@@ -1093,7 +1094,7 @@ class FoodstuffsScraper:
         all_products: list[ScrapedProduct] = []
         fast_categories = getattr(self, "_fast_categories", False)
         try:
-            for url in random.sample(self.category_urls, len(self.category_urls)):
+            for cat_idx, url in enumerate(random.sample(self.category_urls, len(self.category_urls)), 1):
                 did_paginate = False
                 products: list[ScrapedProduct] = []
                 blocks_before = self.blocks
@@ -1148,6 +1149,26 @@ class FoodstuffsScraper:
                         exc = e
                         logger.warning(f"  [retry {attempt}] failed: {e}")
 
+                if not products:
+                    _cat_name = url.split("/category/")[-1]
+                    _ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    _reason = (
+                        "CF block" if blocked
+                        else f"{type(exc).__name__}: {exc}" if exc
+                        else "empty result after retries"
+                    )
+                    push(
+                        f"Branch: {self.branch_name}\n"
+                        f"Branch ID: {self.branch_id}\n"
+                        f"Store ID: {self.api_store_id}\n"
+                        f"Category {cat_idx}/{len(self.category_urls)}: {_cat_name}\n"
+                        f"Reason: {_reason}\n"
+                        f"Time: {_ts}",
+                        title=f"[{self.cfg['name']}] Category Failed",
+                        priority="high",
+                        tags=["rotating_light"],
+                        topic="ok",
+                    )
                 all_products.extend(products)
                 if did_paginate:
                     await self._refresh_context()
@@ -1592,6 +1613,10 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
     # Solve CF once — shared across all workers
     cf_state = CfState()
     await cf_state.solve(cfg)
+    if not cf_state.cookies:
+        logger.info("[cf] startup solve returned no cookies — retrying in 3s ...")
+        await asyncio.sleep(3)
+        await cf_state.solve(cfg)
 
     # Single shared browser — workers create lightweight contexts only
     playwright_instance = await async_playwright().start()

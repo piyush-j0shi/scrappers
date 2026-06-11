@@ -56,6 +56,7 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from supabase import create_client, Client
+from notify import push
 
 # ---------------------------------------------------------------------------
 # Paths & env
@@ -853,11 +854,14 @@ class WoolworthsClaudeScraper:
 
         all_products: list[ScrapedProduct] = []
         try:
-            for url in self.category_urls:
+            for cat_idx, url in enumerate(self.category_urls, 1):
                 did_paginate = False
                 products: list[ScrapedProduct] = []
                 num_responses = 0
                 used_fast = False
+                exc: Optional[Exception] = None
+                silent_block = False
+                visible_block = False
 
                 # Fast path: skip browser nav if template is captured and flag is set.
                 if self.fast_categories and self._fast_template_url:
@@ -873,6 +877,7 @@ class WoolworthsClaudeScraper:
                     try:
                         products, did_paginate, num_responses = await self.scrape_one_category(url)
                     except Exception as e:
+                        exc = e
                         logger.warning(f"category failed: {url}: {e}")
 
                     # Block detection: 3 signals, any one triggers recovery
@@ -884,7 +889,6 @@ class WoolworthsClaudeScraper:
                     #   - Proxy:    refresh context + slight delay + retry once (proxy stays the same;
                     #               new TLS handshake + jitter usually carries enough trust to pass)
                     silent_block = (not products) and (num_responses == 0)
-                    visible_block = False
                     if (not products) and session_path:
                         try:
                             title = await self._page.title()
@@ -917,12 +921,33 @@ class WoolworthsClaudeScraper:
                             else:
                                 logger.warning(f"  [block] retry STILL empty ({num_responses} XHRs) — moving on")
                         except Exception as e:
+                            exc = e
                             logger.warning(f"  retry failed: {e}")
 
                     if did_paginate:
                         await self._refresh_context()
                     await self._random_delay()
 
+                if not products:
+                    _cat_name = url.split("/browse/")[-1]
+                    _ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    _reason = (
+                        "visible block (challenge page)" if visible_block
+                        else "silent block (0 XHRs captured)" if silent_block
+                        else f"{type(exc).__name__}: {exc}" if exc
+                        else "empty result after retry"
+                    )
+                    push(
+                        f"Branch: {self.branch_name}\n"
+                        f"Branch ID: {self.branch_id}\n"
+                        f"Category {cat_idx}/{len(self.category_urls)}: {_cat_name}\n"
+                        f"Reason: {_reason}\n"
+                        f"Time: {_ts}",
+                        title="[Woolworths] Category Failed",
+                        priority="high",
+                        tags=["rotating_light"],
+                        topic="ok",
+                    )
                 all_products.extend(products)
             logger.info(f"TOTAL scraped: {len(all_products)} products")
             self._update_run(run_id, total_scraped=len(all_products))
