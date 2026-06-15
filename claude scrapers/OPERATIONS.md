@@ -12,6 +12,25 @@ All three scrapers read `../.env` (i.e. `scrapers/.env`) for Supabase credential
 
 ---
 
+## Running the full stack
+
+Three things to run. Start them in this order:
+
+**Terminal 1 — Monitor API:**
+```bash
+uvicorn scraper_api:app --host 0.0.0.0 --port 8765
+```
+
+**Terminal 2 — React dashboard:**
+```bash
+cd ../monitor-ui && npm run dev
+```
+Open `http://localhost:5173` — auto-refreshes every 5 seconds as branches complete.
+
+**Terminal 3+ — Scrapers (see below)**
+
+---
+
 ## 1. Woolworths NZ (`woolworths_claude.py`)
 
 ### How to run
@@ -24,10 +43,10 @@ python3 woolworths_claude.py --all-branches --concurrency 5 --fast-categories
 python3 woolworths_claude.py --all-branches --concurrency 5 --fast-categories --proxy-file proxiesthatwork.txt
 
 # Single branch test, no DB writes
-python3 woolworths_claude.py --test --dry-run
+python3 woolworths_claude.py --test --fast-categories --dry-run
 
 # Single named branch
-python3 woolworths_claude.py --branch "Woolworths Ponsonby"
+python3 woolworths_claude.py --branch "Woolworths Ponsonby" --fast-categories
 ```
 
 **Key flags:**
@@ -82,13 +101,11 @@ async def _fetch_page(page_num):
         r = await self._page.request.get(page_url, headers=self._fast_headers)
         if r.ok:
             return page_num, await r.json()
-        # retry once on HTTP 500
     return page_num, None
 
 page_results = await asyncio.gather(
     *[_fetch_page(p) for p in range(2, total_pages + 1)]
 )
-# reassemble in sorted page order — no data mixing
 for _, page_data in sorted(page_results, key=lambda x: x[0]):
     if page_data is not None:
         all_data.append(page_data)
@@ -120,7 +137,7 @@ This means 5 branches can be scraping simultaneously while their individual writ
 
 **5. Branch concurrency via Semaphore**
 
-`asyncio.Semaphore(--concurrency)` gates how many branches run at once. At `--concurrency 5`, 5 full browser sessions + their page-fetch goroutines run simultaneously. The scraper at line 1389 creates this semaphore and wraps each `run_one(branch)` call with it.
+`asyncio.Semaphore(--concurrency)` gates how many branches run at once. At `--concurrency 5`, 5 full browser sessions + their page-fetch goroutines run simultaneously.
 
 **Result:** 4h 51min → **3h 5min** (37% faster), 4 failed branches → **0 failed**.
 
@@ -140,15 +157,16 @@ python3 newworld_claude.py --all-branches --concurrency 5 --fast-categories
 python3 paknsave_claude.py --all-branches --concurrency 5 --fast-categories
 
 # Single branch test, no DB writes
-python3 newworld_claude.py --test --dry-run
-python3 paknsave_claude.py --test --dry-run
+python3 newworld_claude.py --test --fast-categories --dry-run
+python3 paknsave_claude.py --test --fast-categories --dry-run
 
 # Resume an interrupted run (skips already-finished branches)
 python3 newworld_claude.py --all-branches --concurrency 5 --fast-categories --resume
+python3 paknsave_claude.py --all-branches --concurrency 5 --fast-categories --resume
 
 # Single named branch
-python3 newworld_claude.py --branch "New World New Lynn"
-python3 paknsave_claude.py --branch "PAK'nSAVE Sylvia Park"
+python3 newworld_claude.py --branch "New World New Lynn" --fast-categories
+python3 paknsave_claude.py --branch "PAK'nSAVE Sylvia Park" --fast-categories
 ```
 
 **Key flags:**
@@ -159,7 +177,7 @@ python3 paknsave_claude.py --branch "PAK'nSAVE Sylvia Park"
 | `--concurrency N` | Branches in parallel (uses `AdaptiveSemaphore`) |
 | `--fast-categories` | Direct POST path for categories 2..N — skip browser navigation |
 | `--resume` | Skip already-completed branches from checkpoint file |
-| `--no-adaptive-drop` | Keep concurrency fixed even when 429s hit |
+| `--no-adaptive-drop` | Keep concurrency fixed even when CF blocks hit |
 | `--test` | 3 categories, default branch only |
 | `--dry-run` | Scrape but skip Supabase writes |
 
@@ -194,198 +212,172 @@ The secondary bottleneck was **serial barcode enrichment**: neither product list
 
 **1. Cloudflare bypass — `patchright` + `nodriver`**
 
-Standard `playwright` is used for Woolworths. For both New World and Pak'nSave, `patchright` is used instead:
+Standard `playwright` is used for Woolworths. For both New World and Pak'nSave, `patchright` is used instead — it patches browser fingerprints at the CDP level so Cloudflare's bot detection does not flag the browser.
 
-```python
-# foodstuffs_claude.py line 47
-from patchright.async_api import async_playwright, Browser, BrowserContext, Page
-```
-
-`patchright` patches browser fingerprints at the CDP level (specifically `Runtime.enable`) so Cloudflare's bot detection does not flag the browser. No manual stealth scripts are needed.
-
-Before the first category page loads, `nodriver` is used to solve the Turnstile challenge:
-
-```python
-async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
-    import nodriver as uc
-    # nodriver opens a real Chromium, passes the Turnstile, extracts:
-    #   cf_clearance, __cf_bm, _cfuvid cookies
-    ...
-    return cookies, user_agent
-```
-
-These CF cookies are injected into every patchright browser context at startup. Because they were obtained by a real Chrome solving the challenge, Cloudflare accepts them.
+Before the first category page loads, `nodriver` solves the Turnstile challenge and extracts `cf_clearance`, `__cf_bm`, `_cfuvid` cookies. These are injected into every patchright browser context at startup.
 
 **2. One shared CF solve — reused across all workers**
 
-The CF solve is expensive (~4–8 seconds). Rather than solving once per branch (× 148 branches = ~15 minutes of just solving CAPTCHAs), a single `CfState` object is created and shared across all worker coroutines:
+A single `CfState` object is solved once before any branches start, then shared across all worker coroutines. When a worker hits a 403 mid-run, it calls `cf_state.ensure_fresh(cfg)` which re-solves behind an asyncio lock — all other waiting workers immediately reuse the fresh cookies without solving again.
+
+**3. CF startup retry**
+
+If the initial startup CF solve returns empty cookies (Chrome failed to connect on first attempt), the scraper waits 3 seconds and retries before any workers start. Previously, workers would start with empty cookies, the first worker to run would re-solve while all others stalled waiting behind the lock — causing a visible 19-second stall at the start of every run.
 
 ```python
-cf_state = CfState()
-await cf_state.solve(cfg)   # solved once before any branches start
+await cf_state.solve(cfg)
+if not cf_state.cookies:
+    await asyncio.sleep(3)
+    await cf_state.solve(cfg)   # retry once before workers start
 ```
 
-When a worker starts, it reads from `cf_state.cookies` — no extra solve. If a worker hits a 403 mid-run, it calls `cf_state.ensure_fresh(cfg)` which re-solves behind an asyncio lock, and all other workers waiting for the lock immediately reuse the fresh cookies without solving again.
+**4. Automatic CF refresh every 25 minutes**
 
-**3. Automatic CF refresh every 25 minutes**
+A background task re-solves automatically every 25 minutes so no worker ever gets a stale cookie mid-run.
 
-CF cookies expire. A background task re-solves automatically every 25 minutes so no worker ever gets a stale cookie:
+**5. Fast path for categories (`--fast-categories`)**
 
-```python
-async def _periodic_cf_refresh():
-    while True:
-        await asyncio.sleep(25 * 60)   # 25 minutes
-        await cf_state.solve(cfg)
-
-refresh_task = asyncio.create_task(_periodic_cf_refresh())
-```
-
-The task runs concurrently with all branch workers and is cancelled after the last branch finishes.
-
-**4. Fast path for categories (`--fast-categories`)**
-
-The first category per branch uses full browser navigation (POST request intercepted and captured). Every subsequent category uses `_scrape_category_direct`, which replays the captured POST body with a modified `category0SI` filter — no browser navigation needed:
-
-```python
-# Template captured from first browser category
-self._direct_template = captured_post_body
-self._direct_url = captured_post_url
-self._direct_headers = captured_headers
-
-# Direct POST for categories 2..N
-resp = await self._page.request.post(
-    self._direct_url,
-    headers=self._direct_headers,
-    data=modified_body   # only category0SI changes per category
-)
-```
-
-Pages 2..N within each category are fetched sequentially via direct POST (governed by the `TokenBucketLimiter` — 4 req/sec max globally across all workers).
-
-**5. Fallback if fast path fails**
-
-If `_scrape_category_direct` returns `None` (0 products, HTTP error, unknown category slug, or template not yet captured), the caller automatically falls back to the full browser navigation path:
-
-```python
-used_direct = False
-if fast_categories and self._direct_template:
-    direct_products = await self._scrape_category_direct(url)
-    if direct_products is not None:
-        products = direct_products
-        used_direct = True
-
-if not used_direct:
-    products, did_paginate = await self.scrape_one_category(url)  # full browser fallback
-```
-
-No data is lost — the fallback is silent and automatic.
+The first category per branch captures the POST body + headers from browser navigation. Every subsequent category replays that captured request with only the category filter changed — no browser navigation needed. Falls back silently to browser if the direct path returns nothing.
 
 **6. Non-blocking Supabase writes**
 
-Same pattern as Woolworths — the synchronous Supabase SDK is offloaded to a thread pool so the asyncio event loop stays free for other branches while the DB write runs:
+Synchronous Supabase SDK offloaded to thread pool so the event loop stays free for other branches during DB writes.
 
-```python
-await loop.run_in_executor(None, self._save_to_supabase, all_products, stats)
-await loop.run_in_executor(None, lambda: self._end_run(run_id, status, stats))
-```
+**7. AdaptiveSemaphore — concurrency drops on CF block waves, recovers after**
 
-**7. Branch concurrency — `AdaptiveSemaphore`**
-
-Unlike Woolworths which uses a plain `asyncio.Semaphore`, Foodstuffs uses an `AdaptiveSemaphore` that can reduce concurrency at runtime:
+Unlike Woolworths which uses a plain `asyncio.Semaphore`, Foodstuffs uses an `AdaptiveSemaphore`:
 
 - Starts at `--concurrency` (e.g. 5)
-- Counts cumulative CF blocks across all running branches
-- When blocks exceed a threshold (scales with concurrency), calls `.downgrade()` — reduces active concurrency by 1
-- Concurrency is logged in the `DONE` line as `final_concurrency=N`
-
-This means a heavy run that triggers many blocks automatically slows itself down to avoid triggering more, instead of crashing.
-
-**8. `--resume` flag**
-
-After each branch completes successfully, its branch UUID is appended to a checkpoint file:
+- When cumulative CF blocks exceed a threshold, `.downgrade()` reduces active concurrency by 1 to back off
+- After **5 consecutive clean branches** with no blocks, `.upgrade()` restores concurrency directly back to the original max — no gradual climb
+- `--no-adaptive-drop` disables this entirely and keeps concurrency fixed
 
 ```
-.newworld_checkpoint.json   (New World)
-.paknsave_checkpoint.json   (Pak'nSave)
+CF wave hits → drops to conc=2 → 5 clean branches → jumps straight back to conc=5
 ```
 
-If a run is interrupted (power cut, crash, manual stop), restarting with `--resume` reads the checkpoint and skips any branch already in it:
+**8. `--resume` checkpoint**
+
+After each branch completes with no category failures, its UUID is written to a checkpoint file:
+```
+.newworld_checkpoint.json
+.paknsave_checkpoint.json
+```
+
+Restarting with `--resume` skips already-completed branches. Without `--resume`, the checkpoint is deleted and the run starts clean.
+
+**When to use `--resume`:** Only add `--resume` when restarting after an interrupted run (crash, power cut, manual `Ctrl+C`). Do NOT use it on a fresh day's run — it will skip branches that were completed yesterday. Without `--resume`, the checkpoint file is deleted automatically and the run starts from scratch.
+
+**Checkpoint fix:** Previously the checkpoint was never written because the condition checked `records_failed == 0`, but every branch has ~7 unresolvable products (no barcode, no name match) which set `records_failed > 0`. Fixed to only check `categories_failed == 0` — a branch is checkpointed if all its categories returned data, regardless of individual product-level failures.
+
+**9. Category failure detection fix**
+
+Previously `if not products:` after the retry loop would count legitimately empty categories (e.g. `meat-and-seafood-deals` with no current deals) as failures. This caused `categories_failed` to increment on every branch, which blocked checkpointing entirely.
+
+Fixed to only count as a failure when the empty result was caused by an actual block or exception:
 
 ```python
-# On --resume startup:
-completed_ids = set(json.loads(checkpoint_file.read_text()))
-branches = [b for b in branches if b.get("id") not in completed_ids]
-# logs: "[resume] skipping 73 already-completed branches, 75 remaining"
-```
+# Before — false positives on empty-but-valid categories
+if not products:
+    stats["categories_failed"] += 1
 
-Without `--resume`, the checkpoint file is deleted at startup so the run starts clean.
+# After — only real failures
+if not products and (exc is not None or blocked):
+    stats["categories_failed"] += 1
+```
 
 **10. Price change detection fix**
 
-**Problem:** New World and Pak'nSave were always reporting `changes=0` — no price history was ever written.
+New World and Pak'nSave were always reporting `changes=0`. Root cause: the code read the "old" price from the upsert response, but Supabase returns the row *after* the update — so `old_price` always equalled `new_price`.
 
-**Root cause:** The original code tried to read the "old" price from the Supabase upsert response:
+Fix: snapshot existing prices with a `SELECT` before doing any upserts, then compare against those genuine old values.
 
-```python
-# BROKEN — upsert returns post-update rows, so old_price == new_price always
-r = self.supabase.table("store_products").upsert(chunk, ...).execute()
-for row in r.data:
-    old_price = row.get("current_price")   # this is already the NEW value
-    new_price = new_price_map.get(pid)
-    if abs(float(old_price) - new_price) > 0.001:  # always False
-```
+**11. Parallel barcode enrichment + disk cache**
 
-Supabase returns the row **after** the update, not before. So `old_price` always equalled `new_price`, the diff was always 0, and `price_history` was never written for either chain.
+- Up to 12 barcode detail calls fire simultaneously per batch via `asyncio.gather`
+- Every `productId → barcode` mapping is persisted to `.foodstuffs_cache.json` and reused on future runs
+- Cache is shared between New World and Pak'nSave (same Foodstuffs catalogue)
 
-**Fix:** Snapshot existing prices with a `SELECT` **before** doing any upserts — the same approach Woolworths already used:
-
-```python
-# FIXED — fetch existing prices first, then compare against those
-existing_map: dict[str, dict] = {}
-while True:
-    r = (self.supabase.table("store_products")
-         .select("id,product_id,current_price,unit_price")
-         .eq("store_id", self.branch_id)
-         .range(offset, offset + 999).execute())
-    for row in r.data:
-        existing_map[row["product_id"]] = row
-    if len(r.data) < 1000:
-        break
-    offset += 1000
-
-# Now compare new prices against genuine old prices
-for product_id, effective in new_price_map.items():
-    existing = existing_map.get(product_id)
-    if existing and existing.get("current_price") is not None:
-        old_price = float(existing["current_price"])
-        if abs(old_price - effective) > 0.001:
-            ph_rows.append({...})   # correctly records the real price change
-```
-
-The upsert and price_history insert are now separate steps. Adds one paginated `SELECT` per branch (~5 extra queries for a typical branch with 5,000 products), which is negligible against the rest of the run time.
+> **Important:** Do NOT delete `.foodstuffs_cache.json`. Deleting it forces a full re-enrichment on the next run.
 
 ---
 
-**9. Parallel barcode enrichment + disk cache**
+## Monitor API & Dashboard
 
-Barcodes are not in the product listing response — each product needs a separate detail API call. Two optimisations:
+Branch results are POSTed to a local FastAPI server after every branch completes across all three scrapers.
 
-- **Parallel fetching**: up to 12 barcode detail calls fire simultaneously per batch (`asyncio.gather` over batches)
-- **Disk cache**: every `productId → barcode` mapping is persisted to `.foodstuffs_cache.json`. On the next run, cached products skip the API call entirely
+**Files:**
+- `scraper_api.py` — FastAPI server
+- `report_client.py` — sync HTTP client used by all scrapers
+- `../monitor-ui/` — React dashboard
 
-The cache is shared between New World and Pak'nSave (same Foodstuffs catalogue, same productIds). The `DONE` line reports `barcodes(cache/fetched)=X/Y` — cache hits vs actual API calls.
+**API endpoints:**
 
-> **Important:** Do NOT delete `.foodstuffs_cache.json`. It contains hundreds of thousands of barcode mappings. Deleting it forces a full re-enrichment on the next run.
+| Endpoint | What it returns |
+|---|---|
+| `POST /branch-complete` | Receives a branch report from a scraper |
+| `GET /reports` | All branch reports this session |
+| `GET /reports/{chain}` | Reports filtered by chain name |
+| `GET /summary` | Total count, chains seen, last received time |
+| `DELETE /reports` | Clear all in-memory reports |
+| `GET /docs` | Swagger UI (FastAPI auto-generated) |
+
+**Payload per branch report:**
+- `chain`, `branch_name`, `branch_id`, `store_id`
+- `status` — `success` / `partial` / `failed`
+- `total_products`, `price_changes`, `specials`, `out_of_stock`
+- `categories` — array of `{name, status, products, reason}` where status is `success` / `empty` / `failed`
+
+**Note:** Reports are held in memory only. Restarting the API server clears all reports.
 
 ---
 
 ## Recommended run order
 
-Run in this order so New World warms the barcode cache before Pak'nSave:
+Run in this order so New World warms the barcode cache before Pak'nSave. **Wait ~30 minutes between each scraper** — starting them back-to-back hammers the sites simultaneously and increases block rates.
 
-1. Woolworths
-2. New World
-3. Pak'nSave
+1. Start monitor API + dashboard
+2. Woolworths → wait for it to finish, then wait 30 min
+3. New World → wait for it to finish, then wait 30 min
+4. Pak'nSave
+
+If a run is interrupted mid-way, restart with `--resume` to pick up where it left off:
+```bash
+python3 newworld_claude.py --all-branches --concurrency 5 --fast-categories --resume
+python3 paknsave_claude.py --all-branches --concurrency 5 --fast-categories --resume
+```
+Woolworths does not have `--resume` — it is stateless and re-runs all branches from scratch.
+
+---
+
+## After a run completes — scraping missing data
+
+When a run finishes, check the monitor dashboard (`http://localhost:5173`) for any branches marked `partial` or `failed`, or any red category pills (CF blocked categories).
+
+### New World & Pak'nSave
+
+Branches that had any category failure are **not written to the checkpoint file**, so they will be picked up automatically on the next `--resume` run. Simply re-run with `--resume` after the full run finishes:
+
+```bash
+python3 newworld_claude.py --all-branches --concurrency 5 --fast-categories --resume
+python3 paknsave_claude.py --all-branches --concurrency 5 --fast-categories --resume
+```
+
+This will skip all cleanly completed branches and only re-scrape the ones that had failures. Repeat until the monitor shows all branches as `success`.
+
+### Woolworths
+
+Woolworths has no checkpoint. To re-scrape a specific branch that failed, run it by name:
+
+```bash
+python3 woolworths_claude.py --branch "Woolworths Ponsonby" --fast-categories
+```
+
+To re-scrape all branches (e.g. if the block rate was high and many branches got partial data), just run the full command again — it starts from scratch:
+
+```bash
+python3 woolworths_claude.py --all-branches --concurrency 5 --fast-categories
+```
 
 ---
 
@@ -394,6 +386,10 @@ Run in this order so New World warms the barcode cache before Pak'nSave:
 ```bash
 # Follow live progress
 tail -f logs/woolworths_$(date +%Y-%m-%d).log | grep -E "progress:|DONE|WARNING|ERROR"
+tail -f logs/newworld_$(date +%Y-%m-%d).log | grep -E "progress:|DONE|checkpoint|WARNING|ERROR"
+
+# Check specials and OOS samples for a completed branch
+grep -E "\[specials\]|\[oos\]" logs/newworld_$(date +%Y-%m-%d).log
 
 # Get final summary line
 grep "DONE" logs/woolworths_2026-06-08.log
@@ -410,3 +406,10 @@ grep "DONE" logs/woolworths_2026-06-08.log
 | `final_concurrency=N` | Foodstuffs: concurrency after any adaptive drops |
 | `barcodes(cache/fetched)=X/Y` | Foodstuffs: cache hits vs API calls |
 | `elapsed=` | Total wall time |
+
+**Checkpoint files:**
+
+| File | Chain |
+|---|---|
+| `.newworld_checkpoint.json` | New World |
+| `.paknsave_checkpoint.json` | PAK'nSAVE |

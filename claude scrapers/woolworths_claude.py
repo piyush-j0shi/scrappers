@@ -56,7 +56,7 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from supabase import create_client, Client
-from notify import push
+from report_client import post_branch_report
 
 # ---------------------------------------------------------------------------
 # Paths & env
@@ -839,7 +839,7 @@ class WoolworthsClaudeScraper:
 
         run_id = self._start_run()
         stats = {"records_updated": 0, "records_failed": 0, "new_products": 0,
-                 "price_changes": 0, "blocks_detected": 0, "retries": 0}
+                 "price_changes": 0, "blocks_detected": 0, "retries": 0, "category_results": []}
 
         await self._start_browser()
         session_path = self._session_path_for_branch()
@@ -928,25 +928,24 @@ class WoolworthsClaudeScraper:
                         await self._refresh_context()
                     await self._random_delay()
 
-                if not products:
-                    _cat_name = url.split("/browse/")[-1]
-                    _ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                _cat_name = url.split("/browse/")[-1]
+                if not products and (exc is not None or visible_block or silent_block):
                     _reason = (
                         "visible block (challenge page)" if visible_block
                         else "silent block (0 XHRs captured)" if silent_block
                         else f"{type(exc).__name__}: {exc}" if exc
                         else "empty result after retry"
                     )
-                    push(
-                        f"Branch: {self.branch_name}\n"
-                        f"Branch ID: {self.branch_id}\n"
-                        f"Category {cat_idx}/{len(self.category_urls)}: {_cat_name}\n"
-                        f"Reason: {_reason}\n"
-                        f"Time: {_ts}",
-                        title="[Woolworths] Category Failed",
-                        priority="high",
-                        tags=["rotating_light"],
-                        topic="ok",
+                    stats["category_results"].append(
+                        {"name": _cat_name, "status": "failed", "products": 0, "reason": _reason}
+                    )
+                elif not products:
+                    stats["category_results"].append(
+                        {"name": _cat_name, "status": "empty", "products": 0}
+                    )
+                else:
+                    stats["category_results"].append(
+                        {"name": _cat_name, "status": "success", "products": len(products)}
                     )
                 all_products.extend(products)
             logger.info(f"TOTAL scraped: {len(all_products)} products")
@@ -964,6 +963,31 @@ class WoolworthsClaudeScraper:
                 else "success"
             )
             self._end_run(run_id, status, stats)
+            specials = sum(1 for p in all_products if p.special_price is not None)
+            out_of_stock = sum(1 for p in all_products if not p.in_stock)
+
+            if specials:
+                sample = [
+                    f"{p.clean_name!r} ${p.price:.2f}→${p.special_price:.2f}"
+                    for p in all_products if p.special_price is not None
+                ][:5]
+                logger.info(f"[specials] {specials}/{len(all_products)} — sample: {'; '.join(sample)}")
+            if out_of_stock:
+                sample_oos = [p.clean_name for p in all_products if not p.in_stock][:5]
+                logger.info(f"[oos] {out_of_stock}/{len(all_products)} — sample: {sample_oos}")
+
+            post_branch_report(
+                chain="Woolworths",
+                branch_name=self.branch_name,
+                branch_id=str(self.branch_id) if self.branch_id else None,
+                store_id=None,
+                status=status,
+                total_products=len(all_products),
+                categories=stats["category_results"],
+                price_changes=stats["price_changes"],
+                specials=specials,
+                out_of_stock=out_of_stock,
+            )
         except Exception as e:
             logger.exception("run failed")
             self._end_run(run_id, "failed", stats, error=str(e))

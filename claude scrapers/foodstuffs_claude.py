@@ -46,7 +46,7 @@ from dotenv import load_dotenv
 # from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from patchright.async_api import async_playwright, Browser, BrowserContext, Page
 from supabase import create_client, Client
-from notify import push
+from report_client import post_branch_report
 
 # ---------------------------------------------------------------------------
 # Paths & env
@@ -936,11 +936,13 @@ class FoodstuffsScraper:
             return None
 
         special = None
+        special_field = None
         for key in ("salePrice", "promotionPrice", "specialPrice"):
             v = sp.get(key)
             try:
                 if v and float(v) < float(price_cents):
                     special = float(v) / 100
+                    special_field = key
                     break
             except (TypeError, ValueError):
                 continue
@@ -1084,7 +1086,7 @@ class FoodstuffsScraper:
         run_id = self._start_run()
         stats = {"records_updated": 0, "records_failed": 0, "new_products": 0,
                  "price_changes": 0, "barcodes_from_cache": 0, "barcodes_fetched": 0,
-                 "blocks": 0, "categories_failed": 0}
+                 "blocks": 0, "categories_failed": 0, "category_results": []}
 
         # CF solve: use shared state if available (solves once for all workers)
         if self._cf_state:
@@ -1159,26 +1161,24 @@ class FoodstuffsScraper:
                         exc = e
                         logger.warning(f"  [retry {attempt}] failed: {e}")
 
-                if not products:
+                _cat_name = url.split("/category/")[-1]
+                if not products and (exc is not None or blocked):
                     stats["categories_failed"] += 1
-                    _cat_name = url.split("/category/")[-1]
-                    _ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                     _reason = (
                         "CF block" if blocked
                         else f"{type(exc).__name__}: {exc}" if exc
                         else "empty result after retries"
                     )
-                    push(
-                        f"Branch: {self.branch_name}\n"
-                        f"Branch ID: {self.branch_id}\n"
-                        f"Store ID: {self.api_store_id}\n"
-                        f"Category {cat_idx}/{len(self.category_urls)}: {_cat_name}\n"
-                        f"Reason: {_reason}\n"
-                        f"Time: {_ts}",
-                        title=f"[{self.cfg['name']}] Category Failed",
-                        priority="high",
-                        tags=["rotating_light"],
-                        topic="ok",
+                    stats["category_results"].append(
+                        {"name": _cat_name, "status": "failed", "products": 0, "reason": _reason}
+                    )
+                elif not products:
+                    stats["category_results"].append(
+                        {"name": _cat_name, "status": "empty", "products": 0}
+                    )
+                else:
+                    stats["category_results"].append(
+                        {"name": _cat_name, "status": "success", "products": len(products)}
                     )
                 all_products.extend(products)
                 if did_paginate:
@@ -1208,6 +1208,31 @@ class FoodstuffsScraper:
                 else "success"
             )
             await loop.run_in_executor(None, lambda: self._end_run(run_id, status, stats))
+            specials = sum(1 for p in all_products if p.special_price is not None)
+            out_of_stock = sum(1 for p in all_products if not p.in_stock)
+
+            if specials:
+                sample = [
+                    f"{p.clean_name!r} ${p.price:.2f}→${p.special_price:.2f}"
+                    for p in all_products if p.special_price is not None
+                ][:5]
+                logger.info(f"[specials] {specials}/{len(all_products)} — sample: {'; '.join(sample)}")
+            if out_of_stock:
+                sample_oos = [p.clean_name for p in all_products if not p.in_stock][:5]
+                logger.info(f"[oos] {out_of_stock}/{len(all_products)} — sample: {sample_oos}")
+
+            await loop.run_in_executor(None, lambda: post_branch_report(
+                chain=self.cfg["name"],
+                branch_name=self.branch_name,
+                branch_id=str(self.branch_id) if self.branch_id else None,
+                store_id=str(self.api_store_id) if self.api_store_id else None,
+                status=status,
+                total_products=len(all_products),
+                categories=stats["category_results"],
+                price_changes=stats["price_changes"],
+                specials=specials,
+                out_of_stock=out_of_stock,
+            ))
         except Exception as e:
             logger.exception("run failed")
             await loop.run_in_executor(None, lambda: self._end_run(run_id, "failed", stats, error=str(e)))
@@ -1718,13 +1743,15 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
                                 )
                 # Only checkpoint if branch had no empty categories — records_failed includes
                 # normal unresolvable products so don't use it as a disqualifier
-                branch_clean = stats["categories_failed"] == 0
+                branch_clean = stats.get("categories_failed", -1) == 0
+                logger.info(f"[checkpoint] branch={b.get('name')} id={b.get('id')} categories_failed={stats.get('categories_failed', 'MISSING')} branch_clean={branch_clean}")
                 if b.get("id") and branch_clean:
                     completed_ids.add(b["id"])
                     try:
                         checkpoint_file.write_text(json.dumps(list(completed_ids)))
-                    except Exception:
-                        pass
+                        logger.info(f"[checkpoint] written — {len(completed_ids)} branches saved")
+                    except Exception as e:
+                        logger.error(f"[checkpoint] write failed: {e}")
                 # Block-triggered downgrades happen live via on_block_fired callback
             except Exception as e:
                 logger.error(f"branch {b.get('name') or b.get('id')} failed: {e}")
