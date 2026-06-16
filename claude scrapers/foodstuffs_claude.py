@@ -134,7 +134,7 @@ SLUG_TO_DISPLAY_NAME: dict[str, str] = {
     "baby-and-toddler":           "Baby & Toddler",
     "pets":                       "Pets",
     "beer-wine-and-cider":        "Beer, Wine & Cider",
-    # meat-and-seafood-deals: display name not yet confirmed — falls back to browser
+    "meat-and-seafood-deals":     "Meat & Seafood Deals",
 }
 
 # ---------------------------------------------------------------------------
@@ -337,14 +337,13 @@ async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
     except Exception:
         pass
     base_url = cfg["base_url"]
-    probe_url = f"{base_url}/shop/category/fruit-and-vegetables"
     logger.info(f"[cf] launching nodriver to pass Turnstile on {base_url} ...")
     nd_browser = None
     cookies: list[dict] = []
     user_agent: Optional[str] = None
     try:
         nd_browser = await uc.start(headless=False, browser_args=["--disable-http2", "--lang=en-NZ"])
-        page = await nd_browser.get(probe_url)
+        page = await nd_browser.get(f"{base_url}/shop/category/fruit-and-vegetables")
         for _ in range(20):
             await asyncio.sleep(1)
             title = await page.evaluate("document.title")
@@ -715,7 +714,18 @@ class FoodstuffsScraper:
                         f"  [429] retry-after={retry_after}  limit={rate_limit}  remaining={remaining}  "
                         f"all-headers={list(headers.keys())}"
                     )
-                    pause_secs = min(int(retry_after), 5) if retry_after and retry_after.isdigit() else 5
+                    if retry_after and retry_after.isdigit():
+                        ra = int(retry_after)
+                        if ra > 60:
+                            # Long-term IP ban — signal to skip all retries for this category
+                            self._long_ban_active = True
+                            pause_secs = 30  # brief global pause to let other workers notice
+                        else:
+                            self._long_ban_active = False
+                            pause_secs = ra
+                    else:
+                        self._long_ban_active = False
+                        pause_secs = 5
                     if self._rate_limiter:
                         asyncio.create_task(self._rate_limiter.pause(pause_secs))
                 if self.on_block:
@@ -820,13 +830,19 @@ class FoodstuffsScraper:
                     products.append(p)
         logger.info(f"    parsed {len(products)} products from {len(captured)} responses")
 
-        # Save template for direct-POST fast path after any successful browser category
+        # Save template for direct-POST fast path after any successful browser category.
+        # Only accept the template when the filters field contains category0SI — otherwise the
+        # regex replacement in _scrape_category_direct will always fail to match.
         if products and self._api_post_data and self._api_url and self._api_headers:
             if not self._direct_template:
-                self._direct_template = copy.deepcopy(self._api_post_data)
-                self._direct_url = self._api_url
-                self._direct_headers = {k: v for k, v in self._api_headers.items()
-                                         if k.lower() not in ("host", "content-length")}
+                _alg = self._api_post_data.get("algoliaQuery") or {}
+                _filters = _alg.get("filters", "")
+                if 'category0SI:' in _filters:
+                    self._direct_template = copy.deepcopy(self._api_post_data)
+                    self._direct_url = self._api_url
+                    self._direct_headers = {k: v for k, v in self._api_headers.items()
+                                             if k.lower() not in ("host", "content-length")}
+                    logger.info(f"[template] direct-POST API url: {self._direct_url}")
 
         return products, did_paginate
 
@@ -867,12 +883,15 @@ class FoodstuffsScraper:
                 self._direct_url, headers=self._direct_headers, data=body
             )
             if not resp.ok:
-                logger.warning(f"  [direct] {url} → HTTP {resp.status} — browser fallback")
+                if resp.status == 429 or resp.status >= 500:
+                    # Retryable — raise so the category retry loop handles it with proper backoff
+                    raise Exception(f"HTTP {resp.status} on direct POST")
+                logger.warning(f"  [direct] {url} → HTTP {resp.status}")
                 return None
             rj = await resp.json()
         except Exception as e:
-            logger.warning(f"  [direct] {url} → {e} — browser fallback")
-            return None
+            logger.warning(f"  [direct] {url} → {e}")
+            raise  # re-raise so retry loop in _scrape_branch handles it
 
         total_pages = rj.get("totalPages") or 1
         all_responses = [rj]
@@ -1112,7 +1131,10 @@ class FoodstuffsScraper:
                 blocks_before = self.blocks
                 exc: Optional[Exception] = None
 
-                # Fast path: direct POST (skip browser) if template is ready and flag is set
+                # Fast path: direct POST (skip browser) if template is ready and flag is set.
+                # When fast_categories=True and template exists, no browser fallback — direct only.
+                # Browser is only used when the template hasn't been captured yet (first category).
+                self._long_ban_active = False
                 used_direct = False
                 if fast_categories and self._direct_template:
                     try:
@@ -1121,22 +1143,34 @@ class FoodstuffsScraper:
                             products = direct_products
                             used_direct = True
                     except Exception as e:
-                        logger.warning(f"  [direct] {url} unexpected error: {e} — browser fallback")
+                        exc = e  # triggers retry loop below
+                        logger.warning(f"  [direct] {url} error: {e}")
+                    # No browser fallback in fast mode — template exists, direct only
 
-                if not used_direct:
+                if not used_direct and not (fast_categories and self._direct_template):
+                    # Browser: either fast_categories=False, or template not yet captured
                     try:
                         products, did_paginate = await self.scrape_one_category(url)
                     except Exception as e:
                         exc = e
                         logger.warning(f"category failed: {url}: {e}")
 
-                # Auto-recover: up to 2 retries with increasing back-off (browser only)
+                # Auto-recover: up to 2 retries with proper back-off
                 blocked = self.blocks > blocks_before
                 for attempt in range(1, 3):
                     if not ((blocked or exc) and not products):
                         break
+                    # Long-term IP ban — don't retry, it won't help
+                    if getattr(self, '_long_ban_active', False):
+                        logger.warning(f"  [skip-retry] {url} — long-term rate ban, skipping retries")
+                        break
                     reason = "block" if blocked else f"error: {exc}"
-                    logger.warning(f"  [retry {attempt}] category {url} ({reason}) — re-fetching CF clearance + refreshing context")
+                    wait_secs = random.uniform(15 * attempt, 30 * attempt)
+                    logger.warning(
+                        f"  [retry {attempt}] category {url} ({reason}) — "
+                        f"waiting {wait_secs:.0f}s then re-fetching CF clearance"
+                    )
+                    await asyncio.sleep(wait_secs)
                     if self._cf_state:
                         await self._cf_state.ensure_fresh(self.cfg)
                         self._cf_cookies = list(self._cf_state.cookies)
@@ -1147,16 +1181,26 @@ class FoodstuffsScraper:
                         await self._refresh_context()
                     except Exception as e:
                         logger.warning(f"  [retry {attempt}] context refresh failed: {e}")
-                    await asyncio.sleep(random.uniform(4 * attempt, 9 * attempt))
                     exc = None
                     blocks_before = self.blocks
+                    self._long_ban_active = False
                     try:
-                        products, did_paginate = await self.scrape_one_category(url)
-                        if products:
-                            logger.info(f"  [retry {attempt}] succeeded: {len(products)} products")
+                        # In fast mode with template: retry direct POST (no browser)
+                        if fast_categories and self._direct_template:
+                            direct_products = await self._scrape_category_direct(url)
+                            if direct_products is not None:
+                                products = direct_products
+                                logger.info(f"  [retry {attempt}] direct succeeded: {len(products)} products")
+                            else:
+                                logger.warning(f"  [retry {attempt}] direct STILL empty for {url}")
+                                blocked = False
                         else:
-                            logger.warning(f"  [retry {attempt}] STILL empty for {url}")
-                            blocked = self.blocks > blocks_before
+                            products, did_paginate = await self.scrape_one_category(url)
+                            if products:
+                                logger.info(f"  [retry {attempt}] succeeded: {len(products)} products")
+                            else:
+                                logger.warning(f"  [retry {attempt}] STILL empty for {url}")
+                                blocked = self.blocks > blocks_before
                     except Exception as e:
                         exc = e
                         logger.warning(f"  [retry {attempt}] failed: {e}")
@@ -1364,8 +1408,9 @@ class FoodstuffsScraper:
             for i in range(0, len(payload), CHUNK):
                 chunk = payload[i : i + CHUNK]
                 try:
+                    # ignore_duplicates=False (default) so image_url/brand refresh on each run
                     self.supabase.table("products").upsert(
-                        chunk, on_conflict="barcode", ignore_duplicates=True
+                        chunk, on_conflict="barcode"
                     ).execute()
                 except Exception as e:
                     err = str(e)
@@ -1482,6 +1527,29 @@ class FoodstuffsScraper:
                     logger.warning(f"price_history insert chunk {i // CHUNK + 1}: {e}")
             logger.info(f"recorded {len(ph_rows)} price changes")
 
+        # OOS sweep: products in DB but not seen this run → mark in_stock=False.
+        # Only runs when all categories succeeded — if any failed, we'd falsely
+        # mark products from those categories as OOS.
+        if stats.get("categories_failed", 0) == 0 and self.branch_id and existing_map:
+            scraped_pids = set(new_price_map.keys())
+            oos_pids = [pid for pid in existing_map if pid not in scraped_pids]
+            if oos_pids:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                oos_count = 0
+                for i in range(0, len(oos_pids), CHUNK):
+                    chunk_ids = oos_pids[i : i + CHUNK]
+                    try:
+                        self.supabase.table("store_products").update({
+                            "in_stock": False,
+                            "scraped_at": now_iso,
+                        }).eq("store_id", self.branch_id).in_("product_id", chunk_ids).execute()
+                        oos_count += len(chunk_ids)
+                    except Exception as e:
+                        logger.warning(f"[oos-sweep] chunk failed: {e}")
+                logger.info(f"[oos-sweep] marked {oos_count} products as OOS (not seen this run)")
+            else:
+                logger.info("[oos-sweep] all existing products seen — no OOS to mark")
+
     def _resolve_chunk_by_name(self, chunk: list[dict], barcode_to_product: dict[str, dict]) -> None:
         names = [row["name"] for row in chunk]
         try:
@@ -1594,8 +1662,10 @@ def parse_args(argv: Optional[list[str]] = None, default_chain: Optional[str] = 
                     help="Number of branches to scrape in parallel (default 1)")
     ap.add_argument("--no-adaptive-drop", action="store_true", default=False,
                         help="Disable adaptive concurrency drop on 429 blocks (keep concurrency fixed)")
-    ap.add_argument("--fast-categories", action="store_true", default=False,
-                        help="Skip browser for categories 2-N per branch — direct POST reusing captured headers")
+    ap.add_argument("--fast-categories", action="store_true", default=True,
+                        help="Skip browser for categories 2-N per branch — direct POST reusing captured headers (default on)")
+    ap.add_argument("--no-fast-categories", dest="fast_categories", action="store_false",
+                        help="Force browser for every category (disables direct-POST fast path)")
     ap.add_argument("--resume", action="store_true", default=False,
                     help="Skip branches already completed in a previous run (uses checkpoint file)")
     return ap.parse_args(argv)
