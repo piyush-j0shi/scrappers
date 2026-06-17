@@ -57,6 +57,11 @@ SCRAPERS_DIR = THIS_DIR.parent
 ENV_PATH = SCRAPERS_DIR / ".env"
 CACHE_PATH = THIS_DIR / ".foodstuffs_cache.json"
 
+
+def _template_path(chain_key: str) -> Path:
+    return THIS_DIR / f".{chain_key}_direct_template.json"
+
+
 load_dotenv(ENV_PATH)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
@@ -399,6 +404,61 @@ class CfState:
             await self.solve(cfg)
 
 
+class TemplateState:
+    """Shared direct-POST API template. Persisted to disk so future runs skip browser nav."""
+
+    def __init__(self, chain_key: str) -> None:
+        self._path = _template_path(chain_key)
+        self._lock = asyncio.Lock()
+        self.body: Optional[dict] = None
+        self.url: str = ""
+        self.headers: dict[str, str] = {}
+        self.store_id: str = ""  # storeId embedded in the saved body
+        self._load()
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            return
+        try:
+            data = json.loads(self._path.read_text())
+            self.body = data["body_template"]
+            self.url = data["url"]
+            self.headers = data["headers"]
+            self.store_id = data.get("template_store_id", "")
+            logger.info(f"[template] loaded from {self._path.name}")
+        except Exception as e:
+            logger.warning(f"[template] load failed: {e}")
+
+    def save(self, body: dict, url: str, headers: dict, store_id: str) -> None:
+        self.body = body
+        self.url = url
+        self.headers = headers
+        self.store_id = store_id
+        try:
+            self._path.write_text(json.dumps(
+                {"url": url, "headers": headers, "body_template": body, "template_store_id": store_id},
+                ensure_ascii=False, indent=2,
+            ))
+            logger.info(f"[template] saved to {self._path.name}")
+        except Exception as e:
+            logger.warning(f"[template] save failed: {e}")
+
+    def invalidate(self) -> None:
+        self.body = None
+        self.url = ""
+        self.headers = {}
+        self.store_id = ""
+        try:
+            self._path.unlink(missing_ok=True)
+            logger.info("[template] invalidated (deleted from disk)")
+        except Exception:
+            pass
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.body and self.url and self.headers)
+
+
 class TokenBucketLimiter:
     """Token-bucket rate limiter: max `rate` req/s globally across all workers.
     Also acts as a global 429 freeze: any worker that hits a 429 can pause all workers.
@@ -494,6 +554,7 @@ class FoodstuffsScraper:
         cf_state: Optional[CfState] = None,
         shared_browser: Optional[Browser] = None,
         rate_limiter: Optional[TokenBucketLimiter] = None,
+        template_state: Optional[TemplateState] = None,
     ) -> None:
         if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
             raise RuntimeError(f"Missing Supabase env in {ENV_PATH}")
@@ -519,6 +580,7 @@ class FoodstuffsScraper:
         self._cf_state = cf_state
         self._shared_browser = shared_browser
         self._rate_limiter = rate_limiter
+        self._template_state = template_state
 
         self._playwright = None
         self._browser: Optional[Browser] = None
@@ -534,6 +596,7 @@ class FoodstuffsScraper:
         self._direct_template: Optional[dict] = None
         self._direct_headers: dict[str, str] = {}
         self._direct_url: str = ""
+        self._direct_template_store_id: str = ""
 
     # ---- Browser / context ----------------------------------------------
 
@@ -842,7 +905,15 @@ class FoodstuffsScraper:
                     self._direct_url = self._api_url
                     self._direct_headers = {k: v for k, v in self._api_headers.items()
                                              if k.lower() not in ("host", "content-length")}
+                    self._direct_template_store_id = self.api_store_id or ""
                     logger.info(f"[template] direct-POST API url: {self._direct_url}")
+                    if self._template_state and not self._template_state.ready:
+                        self._template_state.save(
+                            self._direct_template,
+                            self._direct_url,
+                            self._direct_headers,
+                            self._direct_template_store_id,
+                        )
 
         return products, did_paginate
 
@@ -860,6 +931,18 @@ class FoodstuffsScraper:
             return None  # unknown slug — browser fallback
 
         body = copy.deepcopy(self._direct_template)
+
+        # Substitute this branch's storeId — template may have been captured by a different branch
+        if self.api_store_id and self._direct_template_store_id and \
+                self._direct_template_store_id != self.api_store_id:
+            tmpl_sid = self._direct_template_store_id
+            for _f in ("storeId", "store_id"):
+                if _f in body:
+                    body[_f] = self.api_store_id
+            _alg0 = body.get("algoliaQuery") or {}
+            if "filters" in _alg0 and tmpl_sid in _alg0["filters"]:
+                _alg0["filters"] = _alg0["filters"].replace(tmpl_sid, self.api_store_id)
+
         alg = body.get("algoliaQuery")
         if not alg or "filters" not in alg:
             logger.warning(f"  [direct] {url} → algoliaQuery/filters missing in template — browser fallback")
@@ -884,8 +967,13 @@ class FoodstuffsScraper:
             )
             if not resp.ok:
                 if resp.status == 429 or resp.status >= 500:
-                    # Retryable — raise so the category retry loop handles it with proper backoff
                     raise Exception(f"HTTP {resp.status} on direct POST")
+                if resp.status in (401, 403):
+                    logger.warning(f"  [direct] {url} → HTTP {resp.status} — API key stale, invalidating template")
+                    if self._template_state:
+                        self._template_state.invalidate()
+                    self._direct_template = None
+                    return None
                 logger.warning(f"  [direct] {url} → HTTP {resp.status}")
                 return None
             rj = await resp.json()
@@ -1041,6 +1129,9 @@ class FoodstuffsScraper:
                     url = BARCODE_API.format(store_id=self.api_store_id, pid=pid)
                     try:
                         assert self._page
+                        # try this if hitting many blocks
+                        # if self._rate_limiter:
+                        #     await self._rate_limiter.acquire()
                         resp = await self._page.request.get(url, headers=headers)
                         if resp.ok:
                             data = await resp.json()
@@ -1107,8 +1198,20 @@ class FoodstuffsScraper:
                  "price_changes": 0, "barcodes_from_cache": 0, "barcodes_fetched": 0,
                  "blocks": 0, "categories_failed": 0, "category_results": []}
 
+        # Pre-load template from shared state (set by a previous run or earlier worker)
+        if self._template_state and self._template_state.ready and not self._direct_template:
+            self._direct_template = copy.deepcopy(self._template_state.body)
+            self._direct_url = self._template_state.url
+            self._direct_headers = dict(self._template_state.headers)
+            self._direct_template_store_id = self._template_state.store_id
+            self._fast_categories = True  # all categories go direct — no browser nav needed
+            logger.info("[template] pre-loaded — all categories will use direct POST, browser nav skipped")
+
         # CF solve: use shared state if available (solves once for all workers)
-        if self._cf_state:
+        # Skipped when template is pre-loaded — API calls go to api-prod (no CF)
+        if self._direct_template:
+            logger.info("[cf] template ready — skipping CF solve for this worker")
+        elif self._cf_state:
             await self._cf_state.ensure_fresh(self.cfg)
             self._cf_cookies = list(self._cf_state.cookies)
             self._cf_user_agent = self._cf_state.user_agent
@@ -1130,6 +1233,16 @@ class FoodstuffsScraper:
                 products: list[ScrapedProduct] = []
                 blocks_before = self.blocks
                 exc: Optional[Exception] = None
+
+                # Pick up template if another worker captured it since this worker started
+                if not self._direct_template and self._template_state and self._template_state.ready:
+                    self._direct_template = copy.deepcopy(self._template_state.body)
+                    self._direct_url = self._template_state.url
+                    self._direct_headers = dict(self._template_state.headers)
+                    self._direct_template_store_id = self._template_state.store_id
+                    fast_categories = True
+                    self._fast_categories = True
+                    logger.info("[template] picked up from shared state mid-run — switching to direct POST")
 
                 # Fast path: direct POST (skip browser) if template is ready and flag is set.
                 # When fast_categories=True and template exists, no browser fallback — direct only.
@@ -1716,13 +1829,21 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
     elif not args.resume and checkpoint_file.exists():
         checkpoint_file.unlink()
 
-    # Solve CF once — shared across all workers
+    # Template persistence — load from disk if available
+    template_state = TemplateState(args.chain)
+    if template_state.ready:
+        logger.info("[template] API template loaded from disk — CF solve and browser nav will be skipped")
+
+    # Solve CF once — shared across all workers (skipped if template already on disk)
     cf_state = CfState()
-    await cf_state.solve(cfg)
-    if not cf_state.cookies:
-        logger.info("[cf] startup solve returned no cookies — retrying in 3s ...")
-        await asyncio.sleep(3)
+    if not template_state.ready:
         await cf_state.solve(cfg)
+        if not cf_state.cookies:
+            logger.info("[cf] startup solve returned no cookies — retrying in 3s ...")
+            await asyncio.sleep(3)
+            await cf_state.solve(cfg)
+    else:
+        logger.info("[cf] skipping CF solve — template pre-loaded")
 
     # Single shared browser — workers create lightweight contexts only
     playwright_instance = await async_playwright().start()
@@ -1735,6 +1856,7 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
     shared_browser = await playwright_instance.chromium.launch(**launch_kwargs)
 
     # Global rate limiter: 4 req/sec max across all workers
+    # try this if hitting many blocks: TokenBucketLimiter(rate=6.0, burst=6)
     rate_limiter = TokenBucketLimiter(rate=4.0, burst=4)
 
     overall = {"branches": 0, "updated": 0, "new": 0, "failed": 0, "price_changes": 0,
@@ -1788,6 +1910,7 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
                 cf_state=cf_state,
                 shared_browser=shared_browser,
                 rate_limiter=rate_limiter,
+                template_state=template_state,
             )
             scraper._fast_categories = getattr(args, "fast_categories", False)
             try:
@@ -1836,6 +1959,8 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
     async def _periodic_cf_refresh():
         while True:
             await asyncio.sleep(25 * 60)
+            if template_state.ready:
+                return  # template in use — CF solve not needed
             logger.info("[cf-refresh] proactive CF clearance re-solve (25-min interval) ...")
             await cf_state.solve(cfg)
 
