@@ -178,6 +178,7 @@ python3 paknsave_claude.py --branch "PAK'nSAVE Sylvia Park" --fast-categories
 | `--fast-categories` | Direct POST path for categories 2..N — skip browser navigation |
 | `--resume` | Skip already-completed branches from checkpoint file |
 | `--no-adaptive-drop` | Keep concurrency fixed even when CF blocks hit |
+| `--capsolver` | Force CapSolver for the Cloudflare solve instead of the free headless UA-spoof (needs setup — see [Cloudflare solving](#cloudflare-solving--free-headless--capsolver-fallback)). Even **without** this flag, CapSolver is used automatically as a fallback when a headless solve is weak. |
 | `--test` | 3 categories, default branch only |
 | `--dry-run` | Scrape but skip Supabase writes |
 
@@ -210,11 +211,16 @@ The secondary bottleneck was **serial barcode enrichment**: neither product list
 
 ### What was fixed and how
 
-**1. Cloudflare bypass — `patchright` + `nodriver`**
+**1. Cloudflare bypass — `patchright` + `nodriver`, with CapSolver auto-fallback**
 
 Standard `playwright` is used for Woolworths. For both New World and Pak'nSave, `patchright` is used instead — it patches browser fingerprints at the CDP level so Cloudflare's bot detection does not flag the browser.
 
-Before the first category page loads, `nodriver` solves the Turnstile challenge and extracts `cf_clearance`, `__cf_bm`, `_cfuvid` cookies. These are injected into every patchright browser context at startup.
+Before the first category page loads, the CF challenge is solved and `cf_clearance` (+ `__cf_bm`, `_cfuvid`) cookies are injected into every patchright browser context. The solve has two paths:
+
+- **Default (free):** a UA-spoofed headless `nodriver` Chrome solves the challenge locally — no cost, no tunnel.
+- **CapSolver fallback (automatic):** if the headless solve comes back **weak** (no `cf_clearance`, or fewer than `MIN_HEADLESS_CF_COOKIES` = 3 cookies — a weak solve tends to 403 mid-scrape), the scraper **auto-shifts to CapSolver** *provided* `CAPSOLVER_API_KEY` + `CAPSOLVER_PROXY` are set in `.env` and the tunnel is up. `--capsolver` forces CapSolver first instead of waiting for a weak headless result.
+
+Whichever path wins, the cookies are stored on the shared `CfState` and reused by all workers. This logic runs at startup **and** mid-run (a 403 triggers a re-solve through the same path). Full setup in [Cloudflare solving](#cloudflare-solving--free-headless--capsolver-fallback).
 
 **2. One shared CF solve — reused across all workers**
 
@@ -299,6 +305,130 @@ Fix: snapshot existing prices with a `SELECT` before doing any upserts, then com
 - Cache is shared between New World and Pak'nSave (same Foodstuffs catalogue)
 
 > **Important:** Do NOT delete `.foodstuffs_cache.json`. Deleting it forces a full re-enrichment on the next run.
+
+**12. Pagination off-by-one fix (0-indexed API) — was silently dropping ~50 products/category**
+
+The Foodstuffs API is **0-indexed**: `page=0` is the first page, and `totalPages` is the page *count*, so valid pages are `0 … totalPages-1`. Both the direct-POST path and the browser-capture path were treating it as 1-indexed — starting at `page=1` and looping `range(2, totalPages+1)`:
+
+```python
+# Before — skips page 0 entirely AND overshoots into an empty out-of-range page
+body["page"] = 1
+for page_num in range(2, total_pages + 1):
+    ...
+
+# After — page 0 is the first page; loop the rest 1..totalPages-1
+body["page"] = 0
+for page_num in range(1, total_pages):
+    ...
+```
+
+Effect: every category lost its first 50 products. Verified against the live site after the fix — e.g. New World Queenstown `meat-poultry-and-seafood` now returns **366 products / 8 pages**, exactly matching the website ("Showing 1–50 of 366 products"). The browser-capture path was additionally hardened to re-fetch all pages authoritatively (so a store-mismatch can't read the wrong store's page count). `totalPages` is read straight from the page-0 response; `algoliaQuery.page` is irrelevant (the top-level `page` field controls paging).
+
+> **Note:** categories with >1000 products cap at `totalPages=20` (Algolia's 20-page × 50 = 1000-hit hard limit). The website has this same limit — not introduced by the fix.
+
+---
+
+## Cloudflare solving — free headless + CapSolver fallback
+
+This applies to **New World & Pak'nSave only** (Woolworths uses Akamai, not Cloudflare).
+
+### When does a CF solve even happen?
+
+Almost never in steady state. The CF solve runs **only** when there is no API template on disk yet (`.newworld_direct_template.json` / `.paknsave_direct_template.json`) — i.e. the first run, or after a template is invalidated (stale API key → 401/403). Once the template exists, every category POSTs directly to `api-prod`, which is **API-key gated, not Cloudflare-challenged**, so daily runs need no CF solve at all and work from any IP (including a dirty server).
+
+### The two solve paths
+
+| Path | When | Cost | Needs tunnel? |
+|---|---|---|---|
+| **Headless UA-spoof** (default) | always tried first (unless `--capsolver`) | free | no |
+| **CapSolver** (`AntiCloudflareTask`) | `--capsolver`, **or** auto-fallback when a headless solve is weak | CapSolver credits | **yes** (proxy.py + bore) |
+
+**Auto-shift rule:** a headless solve is trusted only if it returns `cf_clearance` **and** ≥ `MIN_HEADLESS_CF_COOKIES` (=3) cookies. A weak solve (often just 1 cookie) tends to 403 mid-scrape, so the scraper automatically shifts to CapSolver — **if** creds are configured and the tunnel is up. This works at startup and mid-run (a 403 re-solve runs the same logic), and whichever solve wins is shared with all workers via `CfState`.
+
+> To **disable** the auto-fallback entirely, leave `CAPSOLVER_PROXY` empty in `.env` — the scraper then stays on the free headless path no matter what.
+
+### One-time setup
+
+1. **Install deps.** `proxy.py` is already in `requirements.txt`, so either install everything:
+   ```bash
+   /home/boiledpotato/Downloads/scrapers/.venv/bin/pip install -r requirements.txt
+   ```
+   …or just the proxy on its own (must go into the venv, not system Python):
+   ```bash
+   source /home/boiledpotato/Downloads/scrapers/.venv/bin/activate
+   pip install proxy.py
+   ```
+   It installs the `proxy` console script; run it via `python -m proxy …` (the module form is the most reliable — a bare `proxy` can resolve to a different binary on PATH).
+2. **Download the `bore` binary** (free TCP tunnel — ngrok's free tier now requires a card for TCP, serveo is flaky):
+   ```bash
+   curl -L https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz | tar xz
+   ```
+3. **Add your CapSolver key to `.env`** (`scrapers/.env`):
+   ```
+   CAPSOLVER_API_KEY=CAP-xxxxxxxx
+   CAPSOLVER_PROXY=            # leave empty for now — filled in step "Tunnel" below
+   ```
+
+### Running with CapSolver — terminal by terminal
+
+Keep each of these in its **own terminal**, left running.
+
+**Terminal A — local HTTP proxy (proxy.py):**
+```bash
+cd "/home/boiledpotato/Downloads/scrapers"
+source .venv/bin/activate
+python -m proxy --hostname 127.0.0.1 --port 8888 --log-level INFO
+```
+It should print `Loaded plugin ... HttpProxyPlugin` and then **hang** (serving). Verify in another terminal:
+```bash
+curl -x http://127.0.0.1:8888 https://api.ipify.org ; echo    # should print your home IP
+```
+
+**Terminal B — expose it with bore:**
+```bash
+cd "/home/boiledpotato/Downloads/scrapers"
+./bore local 8888 --to bore.pub
+```
+It prints e.g. `listening at bore.pub:35430`. Verify the **full chain** reaches your home IP:
+```bash
+curl -x http://bore.pub:35430 https://api.ipify.org ; echo    # should print the SAME home IP
+```
+
+**Set `CAPSOLVER_PROXY` in `.env`** to that address:
+```
+CAPSOLVER_PROXY=http://bore.pub:35430
+```
+(The port changes each time `bore` restarts — update `.env` when it does.)
+
+**Terminal C — run the scraper:**
+```bash
+cd "/home/boiledpotato/Downloads/scrapers/claude scrapers"
+source ../.venv/bin/activate
+
+# Force CapSolver for the solve:
+python3 newworld_claude.py --all-branches --concurrency 5 --fast-categories --capsolver
+
+# Or omit --capsolver to use free headless first, with CapSolver as the automatic fallback.
+```
+
+Success looks like:
+```
+[cf] CapSolver AntiCloudflareTask via proxy http:***  bind_ua=Mozilla/5.0 (X11; Linux x86_64)…
+[cf] CapSolver solved — 1 cookies (cf_clearance)  ua-bound=Mozilla/5.0 (X11; Linux x86_64)…
+[cf] injected 1 CF cookies into browser context
+```
+
+### How it works (why each piece exists)
+
+- CapSolver is a remote service, so it can't use your home IP by itself. `proxy.py` + `bore` expose a tunnel whose exit is **your home IP**; CapSolver solves the challenge through it, so the resulting `cf_clearance` is bound to your IP.
+- `cf_clearance` is also bound to the **User-Agent** that solved it. The scraper sends a fixed UA (`_SPOOF_UA`) to CapSolver and sets the patchright browser context to the **same** UA, so CF's UA-binding check passes.
+- **The scrape itself runs direct (not through bore).** Only the *solve* tunnels — proxy.py runs locally so the scrape's IP is already your home IP. Routing the scrape through the shared `bore.pub` relay would just add latency/flakiness.
+
+### Caveats (important)
+
+- ⚠️ **`bore.pub` is a free shared relay** — fine for a one-off solve/demo, **not** reliable for unattended scheduled runs. If it's down, the auto-shift can't reach CapSolver and the scraper falls back to the (possibly weak) headless result.
+- ⚠️ **CapSolver does not fix an IP-reputation 403.** Because bore exits your home IP, a `cf_clearance` CapSolver returns is bound to that same IP. If you're getting 403s because the IP is rate-limited (e.g. many runs in a short window), CapSolver won't help — wait/back off or use a different network.
+- After the template is captured, you can stop proxy.py + bore; they're only needed while solving.
 
 ---
 

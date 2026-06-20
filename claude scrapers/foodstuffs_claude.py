@@ -524,12 +524,30 @@ async def _solve_cf_via_capsolver(cfg: dict) -> tuple[list[dict], Optional[str]]
     return await asyncio.to_thread(_capsolver_solve_blocking, target_url, domain, _SPOOF_UA)
 
 
+# A headless solve is only trusted if it yields cf_clearance AND at least this many CF
+# cookies. A weak solve (often just 1 cookie) tends to 403 mid-scrape; at/below this we
+# escalate to CapSolver. A healthy CF solve sets cf_clearance + __cf_bm + _cfuvid (3).
+MIN_HEADLESS_CF_COOKIES = 3
+
+
+def _cf_solve_ok(cookies: list[dict]) -> bool:
+    """True only if the headless solve looks strong enough to trust (else escalate)."""
+    names = {c.get("name") for c in cookies}
+    return "cf_clearance" in names and len(cookies) >= MIN_HEADLESS_CF_COOKIES
+
+
 async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
     """Get CF clearance for the one-time template capture, with automatic fallback.
 
-    - Default: free UA-spoofed headless solve first; if it yields no cookies, AUTO-SHIFT to
-      CapSolver when creds are configured (CAPSOLVER_API_KEY + CAPSOLVER_PROXY in .env).
+    - Default: free UA-spoofed headless solve first; if it yields a WEAK result
+      (no cf_clearance, or fewer than MIN_HEADLESS_CF_COOKIES cookies — a weak solve tends
+      to 403 mid-scrape), AUTO-SHIFT to CapSolver when creds are configured
+      (CAPSOLVER_API_KEY + CAPSOLVER_PROXY in .env).
     - With --capsolver: CapSolver first, headless as the backup.
+
+    The result is stored on the shared CfState, so whichever solve wins is reused by ALL
+    workers — this applies at startup and mid-run (a 403 triggers CfState.ensure_fresh,
+    which re-runs this same logic).
 
     Once the API template is on disk, daily runs POST directly to api-prod (API-key gated,
     not Cloudflare-challenged) and this is not called.
@@ -544,18 +562,19 @@ async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
 
     # Default → free headless UA-spoof first.
     cookies, ua = await _solve_cf_via_headless(cfg)
-    if cookies:
+    if _cf_solve_ok(cookies):
         return cookies, ua
 
-    # Auto-shift: headless got nothing → try CapSolver if creds are configured.
+    # Weak/empty headless solve → escalate to CapSolver if creds are configured.
     if _capsolver_configured():
-        logger.warning("[cf] headless UA-spoof solve got no cookies — auto-shifting to CapSolver")
+        logger.warning(f"[cf] headless solve weak ({len(cookies)} cookies, "
+                       f"need cf_clearance + >={MIN_HEADLESS_CF_COOKIES}) — auto-shifting to CapSolver")
         cs_cookies, cs_ua = await _solve_cf_via_capsolver(cfg)
         if cs_cookies:
             return cs_cookies, cs_ua
-        logger.warning("[cf] CapSolver auto-fallback also produced no cookies")
+        logger.warning("[cf] CapSolver auto-fallback also produced no cookies — using headless result")
     else:
-        logger.warning("[cf] headless solve got no cookies and CapSolver not configured — "
+        logger.warning(f"[cf] headless solve weak ({len(cookies)} cookies) and CapSolver not configured — "
                        "set CAPSOLVER_API_KEY + CAPSOLVER_PROXY in .env to enable auto-shift")
     return cookies, ua
 
@@ -1134,15 +1153,17 @@ class FoodstuffsScraper:
         if not alg or "filters" not in alg:
             logger.warning(f"  [direct] {url} → algoliaQuery/filters missing in template — browser fallback")
             return None
-        original_filters = alg["filters"]
+        # Check for PRESENCE of category0SI, not whether the value changed — otherwise the
+        # category the template was captured from (same value) would falsely look "not found"
+        # and needlessly browser-fall-back every run.
+        if 'category0SI:"' not in alg["filters"]:
+            logger.warning(f"  [direct] {url} → category0SI not found in filters — browser fallback")
+            return None
         alg["filters"] = re.sub(
             r'category0SI:"[^"]*"',
             f'category0SI:"{display_name}"',
-            original_filters,
+            alg["filters"],
         )
-        if alg["filters"] == original_filters:
-            logger.warning(f"  [direct] {url} → category0SI not found in filters — browser fallback")
-            return None
         body["page"] = 0  # API is 0-indexed — page 0 is the first page
 
         category = category_from_url(url)
