@@ -66,6 +66,12 @@ load_dotenv(ENV_PATH)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
+# CapSolver — AntiCloudflareTask routed through a local proxy.py exposed via ngrok,
+# so the challenge is solved (and the resulting cf_clearance is bound) to YOUR home IP.
+# CAPSOLVER_PROXY is the ngrok forwarding address, e.g. http://0.tcp.ngrok.io:12345
+CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
+CAPSOLVER_PROXY = os.getenv("CAPSOLVER_PROXY", "")
+
 # ---------------------------------------------------------------------------
 # Chain config
 # ---------------------------------------------------------------------------
@@ -396,12 +402,123 @@ async def _solve_cf_via_headless(cfg: dict) -> tuple[list[dict], Optional[str]]:
     return cookies, user_agent
 
 
-async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
-    """Get CF clearance via a UA-spoofed headless browser (free).
+def _capsolver_proxy_str(url: str) -> str:
+    """Convert 'http://user:pass@host:port' (ngrok address) → CapSolver proxy string.
 
-    Only needed for the one-time template capture — once the API template is on disk,
-    daily runs POST directly to api-prod (API-key gated, not Cloudflare-challenged).
+    CapSolver wants 'scheme:host:port' or 'scheme:host:port:user:pass'.
     """
+    from urllib.parse import urlparse
+    p = urlparse(url if "://" in url else f"http://{url}")
+    scheme = (p.scheme or "http").lower()
+    parts = [scheme, p.hostname or "", str(p.port or 8080)]
+    if p.username:
+        parts += [p.username, p.password or ""]
+    return ":".join(parts)
+
+
+# Toggled on by the --capsolver CLI flag. When off, CF is solved by the UA-spoofed
+# headless browser (free, no tunnel). When on, CapSolver AntiCloudflareTask is used.
+CAPSOLVER_ENABLED = False
+
+
+def _capsolver_active() -> bool:
+    return bool(CAPSOLVER_ENABLED and CAPSOLVER_API_KEY and CAPSOLVER_PROXY)
+
+
+def _capsolver_solve_blocking(target_url: str, domain: str) -> tuple[list[dict], Optional[str]]:
+    """Synchronous CapSolver AntiCloudflareTask call. Run inside asyncio.to_thread.
+
+    Solves the Cloudflare challenge through the ngrok→home-IP proxy, so the returned
+    cf_clearance is bound to your home IP (matches subsequent requests routed the same way).
+    """
+    import urllib.request
+
+    def _post(path: str, payload: dict) -> dict:
+        req = urllib.request.Request(
+            f"https://api.capsolver.com/{path}",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+
+    proxy = _capsolver_proxy_str(CAPSOLVER_PROXY)
+    logger.info(f"[cf] CapSolver AntiCloudflareTask via proxy {proxy.split(':',1)[0]}:***")
+    create = _post("createTask", {
+        "clientKey": CAPSOLVER_API_KEY,
+        "task": {
+            "type": "AntiCloudflareTask",
+            "websiteURL": target_url,
+            "proxy": proxy,
+        },
+    })
+    if create.get("errorId"):
+        logger.warning(f"[cf] CapSolver createTask error: {create.get('errorDescription')}")
+        return [], None
+    task_id = create.get("taskId")
+    if not task_id:
+        logger.warning("[cf] CapSolver returned no taskId")
+        return [], None
+
+    # Poll up to ~120s
+    for _ in range(40):
+        time.sleep(3)
+        res = _post("getTaskResult", {"clientKey": CAPSOLVER_API_KEY, "taskId": task_id})
+        if res.get("errorId"):
+            logger.warning(f"[cf] CapSolver getTaskResult error: {res.get('errorDescription')}")
+            return [], None
+        if res.get("status") == "ready":
+            sol = res.get("solution", {}) or {}
+            ua = sol.get("userAgent")
+            raw = sol.get("cookies") or {}
+            # cookies may be a dict {name: value} or a list of cookie dicts
+            cookies: list[dict] = []
+            if isinstance(raw, dict):
+                items = raw.items()
+            else:
+                items = [(c.get("name"), c.get("value")) for c in raw if isinstance(c, dict)]
+            for name, value in items:
+                if not name:
+                    continue
+                cookies.append({
+                    "name": name, "value": value, "domain": domain,
+                    "path": "/", "secure": True, "httpOnly": True,
+                })
+            if cookies:
+                logger.info(f"[cf] CapSolver solved — {len(cookies)} cookies "
+                            f"({', '.join(c['name'] for c in cookies)})")
+            else:
+                logger.warning("[cf] CapSolver ready but returned no cookies "
+                               "(may have returned only a Turnstile token)")
+            return cookies, ua
+    logger.warning("[cf] CapSolver timed out after ~120s")
+    return [], None
+
+
+async def _solve_cf_via_capsolver(cfg: dict) -> tuple[list[dict], Optional[str]]:
+    """CapSolver AntiCloudflareTask routed through ngrok→proxy.py→home IP."""
+    from urllib.parse import urlparse
+    base_url = cfg["base_url"]
+    target_url = f"{base_url}/shop/category/fruit-and-vegetables"
+    host = (urlparse(base_url).hostname or "").removeprefix("www.")
+    domain = f".{host}" if host else ""
+    return await asyncio.to_thread(_capsolver_solve_blocking, target_url, domain)
+
+
+async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
+    """Get CF clearance for the one-time template capture.
+
+    If CAPSOLVER_API_KEY + CAPSOLVER_PROXY are set, solve via CapSolver's AntiCloudflareTask
+    through the ngrok tunnel (challenge solved on your home IP). Otherwise fall back to the
+    local headless browser. Once the API template is on disk, daily runs POST directly to
+    api-prod (API-key gated, not Cloudflare-challenged) and this is not called.
+    """
+    if _capsolver_active():
+        cookies, ua = await _solve_cf_via_capsolver(cfg)
+        if cookies:
+            return cookies, ua
+        logger.warning("[cf] CapSolver produced no cookies — falling back to headless solve")
     return await _solve_cf_via_headless(cfg)
 
 
@@ -1804,6 +1921,9 @@ def parse_args(argv: Optional[list[str]] = None, default_chain: Optional[str] = 
                         help="Force browser for every category (disables direct-POST fast path)")
     ap.add_argument("--resume", action="store_true", default=False,
                     help="Skip branches already completed in a previous run (uses checkpoint file)")
+    ap.add_argument("--capsolver", action="store_true", default=False,
+                    help="Solve Cloudflare via CapSolver (needs CAPSOLVER_API_KEY + CAPSOLVER_PROXY in .env). "
+                         "Default: free UA-spoofed headless solve.")
     return ap.parse_args(argv)
 
 
@@ -1817,6 +1937,16 @@ def categories_for(args) -> Optional[list[str]]:
 
 async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[str] = None) -> int:
     args = parse_args(argv, default_chain=default_chain)
+
+    # --capsolver toggles the CapSolver CF-solve path; default is the free headless UA-spoof solve.
+    global CAPSOLVER_ENABLED
+    CAPSOLVER_ENABLED = args.capsolver
+    if args.capsolver and not (CAPSOLVER_API_KEY and CAPSOLVER_PROXY):
+        logger.warning("[cf] --capsolver set but CAPSOLVER_API_KEY/CAPSOLVER_PROXY missing in .env — "
+                       "falling back to headless UA-spoof solve")
+    elif args.capsolver:
+        logger.info("[cf] --capsolver enabled — Cloudflare will be solved via CapSolver AntiCloudflareTask")
+
     headless = not args.no_headless
     cats = categories_for(args)
     cache = BarcodeCache()
@@ -1824,6 +1954,11 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
     sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     cfg = CHAINS[args.chain]
     _setup_file_logging(args.chain)
+
+    # Only the CapSolver solve needs the tunnel (it's remote and must borrow your home IP).
+    # The scrape runs locally — same home IP as the tunnel exit — so it goes direct, avoiding
+    # the slow/flaky shared relay. cf_clearance stays valid because the IP is identical.
+    scrape_proxy = args.proxy
 
     checkpoint_file = Path(__file__).parent / f".{args.chain}_checkpoint.json"
 
@@ -1875,8 +2010,8 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
         "headless": headless,
         "args": ["--disable-http2", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
     }
-    if args.proxy:
-        launch_kwargs["proxy"] = _parse_proxy(args.proxy)
+    if scrape_proxy:
+        launch_kwargs["proxy"] = _parse_proxy(scrape_proxy)
         logger.info(f"[proxy] scrape routed through {launch_kwargs['proxy'].get('server')}")
     shared_browser = await playwright_instance.chromium.launch(**launch_kwargs)
 
@@ -1930,7 +2065,7 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
                 headless=headless,
                 dry_run=args.dry_run,
                 cache=cache,
-                proxy_url=args.proxy,
+                proxy_url=scrape_proxy,
                 on_block=on_block_fired,
                 cf_state=cf_state,
                 shared_browser=shared_browser,
