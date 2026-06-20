@@ -421,8 +421,14 @@ def _capsolver_proxy_str(url: str) -> str:
 CAPSOLVER_ENABLED = False
 
 
+def _capsolver_configured() -> bool:
+    """Creds present — CapSolver can be used (as primary or as auto-fallback)."""
+    return bool(CAPSOLVER_API_KEY and CAPSOLVER_PROXY)
+
+
 def _capsolver_active() -> bool:
-    return bool(CAPSOLVER_ENABLED and CAPSOLVER_API_KEY and CAPSOLVER_PROXY)
+    """CapSolver explicitly requested via --capsolver (and creds present)."""
+    return bool(CAPSOLVER_ENABLED and _capsolver_configured())
 
 
 def _capsolver_solve_blocking(target_url: str, domain: str) -> tuple[list[dict], Optional[str]]:
@@ -507,19 +513,39 @@ async def _solve_cf_via_capsolver(cfg: dict) -> tuple[list[dict], Optional[str]]
 
 
 async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
-    """Get CF clearance for the one-time template capture.
+    """Get CF clearance for the one-time template capture, with automatic fallback.
 
-    If CAPSOLVER_API_KEY + CAPSOLVER_PROXY are set, solve via CapSolver's AntiCloudflareTask
-    through the ngrok tunnel (challenge solved on your home IP). Otherwise fall back to the
-    local headless browser. Once the API template is on disk, daily runs POST directly to
-    api-prod (API-key gated, not Cloudflare-challenged) and this is not called.
+    - Default: free UA-spoofed headless solve first; if it yields no cookies, AUTO-SHIFT to
+      CapSolver when creds are configured (CAPSOLVER_API_KEY + CAPSOLVER_PROXY in .env).
+    - With --capsolver: CapSolver first, headless as the backup.
+
+    Once the API template is on disk, daily runs POST directly to api-prod (API-key gated,
+    not Cloudflare-challenged) and this is not called.
     """
     if _capsolver_active():
+        # Explicitly requested → CapSolver first, headless as backup.
         cookies, ua = await _solve_cf_via_capsolver(cfg)
         if cookies:
             return cookies, ua
         logger.warning("[cf] CapSolver produced no cookies — falling back to headless solve")
-    return await _solve_cf_via_headless(cfg)
+        return await _solve_cf_via_headless(cfg)
+
+    # Default → free headless UA-spoof first.
+    cookies, ua = await _solve_cf_via_headless(cfg)
+    if cookies:
+        return cookies, ua
+
+    # Auto-shift: headless got nothing → try CapSolver if creds are configured.
+    if _capsolver_configured():
+        logger.warning("[cf] headless UA-spoof solve got no cookies — auto-shifting to CapSolver")
+        cs_cookies, cs_ua = await _solve_cf_via_capsolver(cfg)
+        if cs_cookies:
+            return cs_cookies, cs_ua
+        logger.warning("[cf] CapSolver auto-fallback also produced no cookies")
+    else:
+        logger.warning("[cf] headless solve got no cookies and CapSolver not configured — "
+                       "set CAPSOLVER_API_KEY + CAPSOLVER_PROXY in .env to enable auto-shift")
+    return cookies, ua
 
 
 class CfState:
