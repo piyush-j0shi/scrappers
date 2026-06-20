@@ -961,6 +961,14 @@ class FoodstuffsScraper:
             if self._rate_limiter:
                 await self._rate_limiter.acquire()
             nav_resp = await self._page.goto(url, wait_until="load", timeout=60_000)
+            # 425 Too Early — TLS 0-RTT early data rejected (RFC 8470). Re-navigate over the
+            # now-warm connection (no early data on the retry). Quick, before block handling.
+            for _attempt_425 in range(3):
+                if not (nav_resp and nav_resp.status == 425):
+                    break
+                logger.warning(f"  [425] Too Early on {url} — re-navigating ({_attempt_425 + 1}/3)")
+                await asyncio.sleep(0.5 * (_attempt_425 + 1))
+                nav_resp = await self._page.goto(url, wait_until="load", timeout=60_000)
             # Cloudflare block detection
             if nav_resp and nav_resp.status in (403, 429, 503):
                 self.blocks += 1
@@ -1040,10 +1048,10 @@ class FoodstuffsScraper:
                     body = copy.deepcopy(self._api_post_data); body["page"] = 0
                     if self._rate_limiter:
                         await self._rate_limiter.acquire()
-                    resp = await self._page.request.post(self._api_url, headers=headers, data=body)
+                    resp = await self._post_with_425_retry(self._api_url, headers, body)
                     if not resp.ok and resp.status == 500:
                         await asyncio.sleep(3)
-                        resp = await self._page.request.post(self._api_url, headers=headers, data=body)
+                        resp = await self._post_with_425_retry(self._api_url, headers, body)
                     if resp.ok:
                         d0 = await resp.json()
                         captured.append({"url": self._api_url, "data": d0})
@@ -1062,12 +1070,12 @@ class FoodstuffsScraper:
                             body = copy.deepcopy(self._api_post_data); body["page"] = page_num
                             if self._rate_limiter:
                                 await self._rate_limiter.acquire()
-                            resp = await self._page.request.post(self._api_url, headers=headers, data=body)
+                            resp = await self._post_with_425_retry(self._api_url, headers, body)
                             if resp.ok:
                                 captured.append({"url": self._api_url, "data": await resp.json()})
                             elif resp.status == 500:
                                 await asyncio.sleep(3)
-                                resp2 = await self._page.request.post(self._api_url, headers=headers, data=body)
+                                resp2 = await self._post_with_425_retry(self._api_url, headers, body)
                                 if resp2.ok:
                                     captured.append({"url": self._api_url, "data": await resp2.json()})
                                 else:
@@ -1123,6 +1131,23 @@ class FoodstuffsScraper:
 
         return products, did_paginate
 
+    async def _post_with_425_retry(self, url: str, headers: dict, data: dict, attempts: int = 4):
+        """POST that retries HTTP 425 'Too Early'.
+
+        Cloudflare rejects TLS 1.3 0-RTT early data with 425 (RFC 8470). Early data only
+        rides the FIRST request on a resumed TLS connection; resending over the now-warm
+        1-RTT connection succeeds. Surfaces most from a same-region (e.g. NZ) IP, where Chrome
+        is more likely to have a session ticket for the local Cloudflare edge.
+        """
+        resp = None
+        for i in range(attempts):
+            resp = await self._page.request.post(url, headers=headers, data=data)
+            if resp.status != 425:
+                return resp
+            logger.warning(f"  [425] Too Early on {url} — retry {i + 1}/{attempts} over warm connection")
+            await asyncio.sleep(0.4 * (i + 1))
+        return resp
+
     async def _scrape_category_direct(self, url: str) -> Optional[list[ScrapedProduct]]:
         """Skip browser navigation — POST directly using the saved template.
 
@@ -1170,8 +1195,8 @@ class FoodstuffsScraper:
         try:
             if self._rate_limiter:
                 await self._rate_limiter.acquire()
-            resp = await self._page.request.post(
-                self._direct_url, headers=self._direct_headers, data=body
+            resp = await self._post_with_425_retry(
+                self._direct_url, self._direct_headers, body
             )
             if not resp.ok:
                 if resp.status == 429 or resp.status >= 500:
@@ -1198,8 +1223,8 @@ class FoodstuffsScraper:
             try:
                 if self._rate_limiter:
                     await self._rate_limiter.acquire()
-                r2 = await self._page.request.post(
-                    self._direct_url, headers=self._direct_headers, data=pb
+                r2 = await self._post_with_425_retry(
+                    self._direct_url, self._direct_headers, pb
                 )
                 if r2.ok:
                     all_responses.append(await r2.json())
@@ -2194,7 +2219,22 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
 
     refresh_task = asyncio.create_task(_periodic_cf_refresh())
     try:
-        await asyncio.gather(*[run_one(b) for b in branches], return_exceptions=True)
+        # Warm-up: when no template is on disk yet, capture it with ONE branch first, then
+        # launch the rest. Otherwise every worker runs the browser-path template capture in
+        # parallel at startup (each paginating ~20 pages/category) — a request burst that trips
+        # Cloudflare 429 rate-limiting before steady-state scraping begins. Best-effort: if the
+        # capture fails, `ready` stays False and the remaining branches run exactly as before.
+        run_list = branches
+        if branches and not template_state.ready:
+            logger.info("[warmup] no template on disk — capturing with 1 branch before launching the rest")
+            await run_one(branches[0])
+            run_list = branches[1:]
+            if template_state.ready:
+                logger.info("[warmup] template captured — remaining branches start in direct-POST mode")
+            else:
+                logger.warning("[warmup] first branch did not capture a template — "
+                               "remaining branches may briefly contend (no data impact)")
+        await asyncio.gather(*[run_one(b) for b in run_list], return_exceptions=True)
     finally:
         refresh_task.cancel()
         try:
