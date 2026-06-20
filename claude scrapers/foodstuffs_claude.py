@@ -431,11 +431,16 @@ def _capsolver_active() -> bool:
     return bool(CAPSOLVER_ENABLED and _capsolver_configured())
 
 
-def _capsolver_solve_blocking(target_url: str, domain: str) -> tuple[list[dict], Optional[str]]:
+def _capsolver_solve_blocking(target_url: str, domain: str, bind_ua: str) -> tuple[list[dict], Optional[str]]:
     """Synchronous CapSolver AntiCloudflareTask call. Run inside asyncio.to_thread.
 
     Solves the Cloudflare challenge through the ngrok→home-IP proxy, so the returned
     cf_clearance is bound to your home IP (matches subsequent requests routed the same way).
+
+    cf_clearance is also bound to the User-Agent used to solve it. We send a fixed UA
+    (`bind_ua`) so the binding is deterministic, and return the UA the cookie is bound to
+    (CapSolver's echoed UA if present, else the one we sent) so the caller can set the
+    browser context's UA to exactly match. Mismatched UA → CF may reject the cookie.
     """
     import urllib.request
 
@@ -450,13 +455,14 @@ def _capsolver_solve_blocking(target_url: str, domain: str) -> tuple[list[dict],
             return json.loads(resp.read().decode())
 
     proxy = _capsolver_proxy_str(CAPSOLVER_PROXY)
-    logger.info(f"[cf] CapSolver AntiCloudflareTask via proxy {proxy.split(':',1)[0]}:***")
+    logger.info(f"[cf] CapSolver AntiCloudflareTask via proxy {proxy.split(':',1)[0]}:***  bind_ua={bind_ua}")
     create = _post("createTask", {
         "clientKey": CAPSOLVER_API_KEY,
         "task": {
             "type": "AntiCloudflareTask",
             "websiteURL": target_url,
             "proxy": proxy,
+            "userAgent": bind_ua,
         },
     })
     if create.get("errorId"):
@@ -476,7 +482,11 @@ def _capsolver_solve_blocking(target_url: str, domain: str) -> tuple[list[dict],
             return [], None
         if res.get("status") == "ready":
             sol = res.get("solution", {}) or {}
-            ua = sol.get("userAgent")
+            # cf_clearance is bound to the UA used to solve. Prefer CapSolver's echoed UA;
+            # fall back to the UA we sent so the browser context always has a matching UA.
+            ua = sol.get("userAgent") or bind_ua
+            if sol.get("userAgent") and sol["userAgent"] != bind_ua:
+                logger.info(f"[cf] CapSolver used a different UA than requested — binding to: {ua}")
             raw = sol.get("cookies") or {}
             # cookies may be a dict {name: value} or a list of cookie dicts
             cookies: list[dict] = []
@@ -493,7 +503,7 @@ def _capsolver_solve_blocking(target_url: str, domain: str) -> tuple[list[dict],
                 })
             if cookies:
                 logger.info(f"[cf] CapSolver solved — {len(cookies)} cookies "
-                            f"({', '.join(c['name'] for c in cookies)})")
+                            f"({', '.join(c['name'] for c in cookies)})  ua-bound={ua}")
             else:
                 logger.warning("[cf] CapSolver ready but returned no cookies "
                                "(may have returned only a Turnstile token)")
@@ -509,7 +519,9 @@ async def _solve_cf_via_capsolver(cfg: dict) -> tuple[list[dict], Optional[str]]
     target_url = f"{base_url}/shop/category/fruit-and-vegetables"
     host = (urlparse(base_url).hostname or "").removeprefix("www.")
     domain = f".{host}" if host else ""
-    return await asyncio.to_thread(_capsolver_solve_blocking, target_url, domain)
+    # Bind the cookie to the SAME UA the patchright context uses (_SPOOF_UA), so CF's
+    # UA-binding check passes. _new_context() sets user_agent=self._cf_user_agent (this UA).
+    return await asyncio.to_thread(_capsolver_solve_blocking, target_url, domain, _SPOOF_UA)
 
 
 async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
