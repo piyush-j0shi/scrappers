@@ -1,9 +1,19 @@
 playwright>=1.50
 patchright==1.60.0
-nodriver
+# nodriver 0.38 requires websockets<=13.1 and crashes ("'NoneType' has no attribute 'closed'")
+# with newer websockets. 0.50.3+ works with websockets>=14 — keep it pinned at/above 0.50.3.
+nodriver>=0.50.3
 supabase==2.5.0
 python-dotenv==1.0.1
 aiohttp>=3.9
 fastapi>=0.100.0
 uvicorn>=0.20.0
 pydantic>=2.0
+
+# --- CapSolver Cloudflare-solve path (--capsolver flag) ---
+# Local HTTP proxy that the challenge solve is routed through (exposed to CapSolver via a TCP tunnel).
+proxy.py>=2.4
+# CapSolver itself is called over plain stdlib urllib — no extra package needed.
+# NON-pip tool also required for --capsolver (install manually):
+#   bore — TCP tunnel binary: https://github.com/ekzhang/bore/releases
+#          run:  ./bore local 8888 --to bore.pub

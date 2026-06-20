@@ -993,7 +993,8 @@ class FoodstuffsScraper:
             await self._page.wait_for_timeout(500)
 
             # Step 1: pin to our branch by overriding storeId in the POST body.
-            if self.api_store_id and self._api_post_data and self._api_url and self._api_headers:
+            # (No fetch here — Step 2 does all paging authoritatively against the pinned body.)
+            if self.api_store_id and self._api_post_data:
                 store_field = next(
                     (f for f in ("storeId", "store_id") if f in self._api_post_data), None
                 )
@@ -1003,55 +1004,63 @@ class FoodstuffsScraper:
                     alg = self._api_post_data.get("algoliaQuery") or {}
                     if "filters" in alg and old_id and old_id in alg["filters"]:
                         alg["filters"] = alg["filters"].replace(old_id, self.api_store_id)
-                    captured[:] = [e for e in captured if "paginated/products" not in e.get("url", "")]
-                    headers = {k: v for k, v in self._api_headers.items()
-                               if k.lower() not in ("host", "content-length")}
-                    body = copy.deepcopy(self._api_post_data); body["page"] = 1
-                    try:
-                        if self._rate_limiter:
-                            await self._rate_limiter.acquire()
-                        resp = await self._page.request.post(self._api_url, headers=headers, data=body)
-                        if resp.ok:
-                            captured.append({"url": self._api_url, "data": await resp.json()})
-                    except Exception as e:
-                        logger.warning(f"  store-pinned page-1 fetch failed: {e}")
 
-            # Step 2: total pages
-            total_pages = 1
-            for entry in captured:
-                if "paginated/products" in entry.get("url", ""):
-                    d = entry.get("data") or {}
-                    total_pages = max(total_pages, d.get("totalPages") or 1)
-                    break
-
-            if total_pages > 1 and self._api_url and self._api_headers and self._api_post_data:
-                did_paginate = True
-                logger.info(f"    pagination: {total_pages} pages")
+            # Step 2: fetch ALL pages authoritatively. The API is 0-indexed — page 0 is the
+            # first page and `totalPages` is the page COUNT, so valid pages are 0..totalPages-1.
+            # We discard whatever the browser happened to capture (it may be the pre-substitution
+            # store, or a partial scroll) and re-fetch every page via the pinned body, so the
+            # result matches the website exactly with no missing first page and no duplicates.
+            if self._api_url and self._api_headers and self._api_post_data:
+                captured[:] = [e for e in captured if "paginated/products" not in e.get("url", "")]
                 headers = {k: v for k, v in self._api_headers.items()
                            if k.lower() not in ("host", "content-length")}
-                for page_num in range(2, total_pages + 1):
-                    try:
-                        body = copy.deepcopy(self._api_post_data); body["page"] = page_num
-                        if self._rate_limiter:
-                            await self._rate_limiter.acquire()
+
+                # Page 0 first → gives the true page count for this store+category.
+                total_pages = 1
+                try:
+                    body = copy.deepcopy(self._api_post_data); body["page"] = 0
+                    if self._rate_limiter:
+                        await self._rate_limiter.acquire()
+                    resp = await self._page.request.post(self._api_url, headers=headers, data=body)
+                    if not resp.ok and resp.status == 500:
+                        await asyncio.sleep(3)
                         resp = await self._page.request.post(self._api_url, headers=headers, data=body)
-                        if resp.ok:
-                            captured.append({"url": self._api_url, "data": await resp.json()})
-                        elif resp.status == 500:
-                            await asyncio.sleep(3)
-                            resp2 = await self._page.request.post(self._api_url, headers=headers, data=body)
-                            if resp2.ok:
-                                captured.append({"url": self._api_url, "data": await resp2.json()})
+                    if resp.ok:
+                        d0 = await resp.json()
+                        captured.append({"url": self._api_url, "data": d0})
+                        total_pages = d0.get("totalPages") or 1
+                    else:
+                        logger.warning(f"    page 0: HTTP {resp.status} — stopping")
+                except Exception as e:
+                    logger.warning(f"    page 0: {e} — stopping")
+
+                # Remaining pages 1..totalPages-1
+                if total_pages > 1:
+                    did_paginate = True
+                    logger.info(f"    pagination: {total_pages} pages")
+                    for page_num in range(1, total_pages):
+                        try:
+                            body = copy.deepcopy(self._api_post_data); body["page"] = page_num
+                            if self._rate_limiter:
+                                await self._rate_limiter.acquire()
+                            resp = await self._page.request.post(self._api_url, headers=headers, data=body)
+                            if resp.ok:
+                                captured.append({"url": self._api_url, "data": await resp.json()})
+                            elif resp.status == 500:
+                                await asyncio.sleep(3)
+                                resp2 = await self._page.request.post(self._api_url, headers=headers, data=body)
+                                if resp2.ok:
+                                    captured.append({"url": self._api_url, "data": await resp2.json()})
+                                else:
+                                    logger.warning(f"    page {page_num}: HTTP {resp2.status} after retry — stopping")
+                                    break
                             else:
-                                logger.warning(f"    page {page_num}: HTTP {resp2.status} after retry — stopping")
+                                logger.warning(f"    page {page_num}: HTTP {resp.status} — stopping")
                                 break
-                        else:
-                            logger.warning(f"    page {page_num}: HTTP {resp.status} — stopping")
+                        except Exception as e:
+                            logger.warning(f"    page {page_num}: {e} — stopping")
                             break
-                    except Exception as e:
-                        logger.warning(f"    page {page_num}: {e} — stopping")
-                        break
-                    await asyncio.sleep(0.4)
+                        await asyncio.sleep(0.4)
         finally:
             try:
                 await self._page.unroute_all(behavior="ignoreErrors")
@@ -1134,7 +1143,7 @@ class FoodstuffsScraper:
         if alg["filters"] == original_filters:
             logger.warning(f"  [direct] {url} → category0SI not found in filters — browser fallback")
             return None
-        body["page"] = 1
+        body["page"] = 0  # API is 0-indexed — page 0 is the first page
 
         category = category_from_url(url)
         try:
@@ -1159,10 +1168,10 @@ class FoodstuffsScraper:
             logger.warning(f"  [direct] {url} → {e}")
             raise  # re-raise so retry loop in _scrape_branch handles it
 
-        total_pages = rj.get("totalPages") or 1
+        total_pages = rj.get("totalPages") or 1  # page COUNT; valid pages are 0..total_pages-1
         all_responses = [rj]
 
-        for page_num in range(2, total_pages + 1):
+        for page_num in range(1, total_pages):
             pb = copy.deepcopy(body)
             pb["page"] = page_num
             try:
