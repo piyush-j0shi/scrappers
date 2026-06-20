@@ -329,11 +329,16 @@ def _parse_proxy(url: str) -> dict:
     return out
 
 
-async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
-    """Open nodriver, pass Turnstile, return (cf_cookies, user_agent)."""
+_SPOOF_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+)
+
+
+async def _solve_cf_via_headless(cfg: dict) -> tuple[list[dict], Optional[str]]:
+    """UA-spoofed headless Chrome — CF auto-passes on a normal IP, no paid solver needed."""
     import nodriver as uc
     import nodriver.cdp.network as _cdn
-    # Chrome 147+ removed 'sameParty' from CDP Cookie — patch before use
     try:
         _orig_fj = _cdn.Cookie.from_json.__func__
         _cdn.Cookie.from_json = classmethod(
@@ -342,21 +347,30 @@ async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
     except Exception:
         pass
     base_url = cfg["base_url"]
-    logger.info(f"[cf] launching nodriver to pass Turnstile on {base_url} ...")
+    target_url = f"{base_url}/shop/category/fruit-and-vegetables"
+    logger.info(f"[cf] headless Chrome (UA-spoof) on {base_url} ...")
     nd_browser = None
     cookies: list[dict] = []
     user_agent: Optional[str] = None
     try:
-        nd_browser = await uc.start(headless=False, browser_args=["--disable-http2", "--lang=en-NZ"])
-        page = await nd_browser.get(f"{base_url}/shop/category/fruit-and-vegetables")
+        nd_browser = await uc.start(
+            headless=True,
+            browser_args=[
+                "--disable-http2",
+                "--lang=en-NZ",
+                "--disable-dev-shm-usage",
+                f"--user-agent={_SPOOF_UA}",
+            ],
+        )
+        page = await nd_browser.get(target_url)
         for _ in range(20):
             await asyncio.sleep(1)
             title = await page.evaluate("document.title")
             if title and "just a moment" not in title.lower():
                 break
-        await asyncio.sleep(4)  # allow __cf_bm / _cfuvid to be written by CF JS
+        await asyncio.sleep(5)
         user_agent = await page.evaluate("navigator.userAgent")
-        logger.info(f"[cf] nodriver UA: {user_agent}")
+        logger.info(f"[cf] UA: {user_agent}")
         try:
             all_cookies = await asyncio.wait_for(nd_browser.cookies.get_all(), timeout=8)
         except asyncio.TimeoutError:
@@ -368,11 +382,11 @@ async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
             if c.name in ("cf_clearance", "__cf_bm", "_cfuvid")
         ]
         if cookies:
-            logger.info(f"[cf] got {len(cookies)} CF cookies — Turnstile passed")
+            logger.info(f"[cf] got {len(cookies)} CF cookies (headless)")
         else:
             logger.warning("[cf] no CF cookies — Turnstile may not have resolved")
     except Exception as e:
-        logger.warning(f"[cf] nodriver failed: {e} — proceeding without CF clearance")
+        logger.warning(f"[cf] headless solve failed: {e} — proceeding without CF clearance")
     finally:
         if nd_browser:
             try:
@@ -380,6 +394,15 @@ async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
             except Exception:
                 pass
     return cookies, user_agent
+
+
+async def _solve_cf_clearance(cfg: dict) -> tuple[list[dict], Optional[str]]:
+    """Get CF clearance via a UA-spoofed headless browser (free).
+
+    Only needed for the one-time template capture — once the API template is on disk,
+    daily runs POST directly to api-prod (API-key gated, not Cloudflare-challenged).
+    """
+    return await _solve_cf_via_headless(cfg)
 
 
 class CfState:
@@ -1826,7 +1849,8 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
             logger.info(f"[resume] skipping {skipped} already-completed branches, {len(branches)} remaining")
         except Exception as e:
             logger.warning(f"[resume] checkpoint load failed: {e} — starting fresh")
-    elif not args.resume and checkpoint_file.exists():
+    elif not args.resume and args.all_branches and checkpoint_file.exists():
+        # Only wipe checkpoint when doing a fresh full run, not single-branch tests
         checkpoint_file.unlink()
 
     # Template persistence — load from disk if available
@@ -1853,6 +1877,7 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
     }
     if args.proxy:
         launch_kwargs["proxy"] = _parse_proxy(args.proxy)
+        logger.info(f"[proxy] scrape routed through {launch_kwargs['proxy'].get('server')}")
     shared_browser = await playwright_instance.chromium.launch(**launch_kwargs)
 
     # Global rate limiter: 4 req/sec max across all workers
