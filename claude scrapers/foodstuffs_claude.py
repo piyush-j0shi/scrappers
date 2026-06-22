@@ -62,6 +62,42 @@ def _template_path(chain_key: str) -> Path:
     return THIS_DIR / f".{chain_key}_direct_template.json"
 
 
+# A JWT is three base64url segments; the first two start with "eyJ" (base64 of '{"').
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+
+
+def _find_jwt(obj):
+    """Return the first JWT-looking string anywhere in a decoded-JSON object, else None.
+    Tolerates wrappers like `Bearer `/`JWT `/quotes/byte-strings (we just search for the pattern)."""
+    if isinstance(obj, str):
+        m = _JWT_RE.search(obj)
+        return m.group(0) if m else None
+    if isinstance(obj, dict):
+        for v in obj.values():
+            t = _find_jwt(v)
+            if t:
+                return t
+    elif isinstance(obj, list):
+        for v in obj:
+            t = _find_jwt(v)
+            if t:
+                return t
+    return None
+
+
+def _swap_store_in_body(body: dict, old_sid: str, new_sid: str) -> None:
+    """In-place: replace the capture store id with this branch's store id, wherever it appears
+    (top-level storeId/store_id and inside the algoliaQuery.filters string)."""
+    if not (old_sid and new_sid and old_sid != new_sid):
+        return
+    for f in ("storeId", "store_id"):
+        if f in body:
+            body[f] = new_sid
+    alg = body.get("algoliaQuery") or {}
+    if isinstance(alg, dict) and isinstance(alg.get("filters"), str) and old_sid in alg["filters"]:
+        alg["filters"] = alg["filters"].replace(old_sid, new_sid)
+
+
 load_dotenv(ENV_PATH)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
@@ -607,10 +643,13 @@ class TemplateState:
     def __init__(self, chain_key: str) -> None:
         self._path = _template_path(chain_key)
         self._lock = asyncio.Lock()
-        self.body: Optional[dict] = None
+        self.body: Optional[dict] = None             # legacy single body (old format / fallback)
+        self.bodies: dict[str, dict] = {}            # per-category slug -> request body (verbatim replay)
         self.url: str = ""
         self.headers: dict[str, str] = {}
-        self.store_id: str = ""  # storeId embedded in the saved body
+        self.store_id: str = ""                      # storeId the bodies were captured under
+        self.token_request: Optional[dict] = None    # how to re-mint the Bearer (mid-run 401)
+        self.token_version: int = 0                  # bumped on each refresh; workers adopt newest
         self._load()
 
     def _load(self) -> None:
@@ -618,33 +657,64 @@ class TemplateState:
             return
         try:
             data = json.loads(self._path.read_text())
-            self.body = data["body_template"]
             self.url = data["url"]
             self.headers = data["headers"]
             self.store_id = data.get("template_store_id", "")
-            logger.info(f"[template] loaded from {self._path.name}")
+            self.bodies = data.get("bodies", {}) or {}
+            self.body = data.get("body_template")     # may be None in new format
+            self.token_request = data.get("token_request")
+            extra = f", {len(self.bodies)} categories" if self.bodies else ""
+            tok = ", token-refresh ready" if self.token_request else ""
+            logger.info(f"[template] loaded from {self._path.name}{extra}{tok}")
         except Exception as e:
             logger.warning(f"[template] load failed: {e}")
 
-    def save(self, body: dict, url: str, headers: dict, store_id: str) -> None:
-        self.body = body
-        self.url = url
-        self.headers = headers
-        self.store_id = store_id
+    def _persist(self) -> None:
         try:
-            self._path.write_text(json.dumps(
-                {"url": url, "headers": headers, "body_template": body, "template_store_id": store_id},
-                ensure_ascii=False, indent=2,
-            ))
-            logger.info(f"[template] saved to {self._path.name}")
+            self._path.write_text(json.dumps({
+                "url": self.url,
+                "headers": self.headers,
+                "template_store_id": self.store_id,
+                "bodies": self.bodies,
+                "token_request": self.token_request,
+                "body_template": self.body or next(iter(self.bodies.values()), None),
+            }, ensure_ascii=False, indent=2))
         except Exception as e:
             logger.warning(f"[template] save failed: {e}")
 
+    def save_category(self, slug: str, body: dict, url: str, headers: dict, store_id: str) -> None:
+        """Record one category's working request body (verbatim replay — no field parsing)."""
+        self.url = url
+        self.headers = headers
+        self.store_id = store_id
+        first = not self.bodies
+        self.bodies[slug] = body
+        self._persist()
+        if first:
+            logger.info(f"[template] saved to {self._path.name} (direct-POST: {url})")
+        logger.info(f"[template] captured category '{slug}' ({len(self.bodies)} total)")
+
+    def save_token_request(self, token_request: dict) -> None:
+        if self.token_request:
+            return
+        self.token_request = token_request
+        self._persist()
+        logger.info(f"[template] token-mint request captured ({token_request.get('url')}) — "
+                    f"mid-run 401s can refresh the Bearer")
+
+    def set_token(self, new_token: str) -> None:
+        """Patch the Bearer in the shared headers after a refresh, and persist."""
+        self.headers = {**self.headers, "authorization": f"Bearer {new_token}"}
+        self.token_version += 1
+        self._persist()
+
     def invalidate(self) -> None:
         self.body = None
+        self.bodies = {}
         self.url = ""
         self.headers = {}
         self.store_id = ""
+        self.token_request = None
         try:
             self._path.unlink(missing_ok=True)
             logger.info("[template] invalidated (deleted from disk)")
@@ -653,7 +723,7 @@ class TemplateState:
 
     @property
     def ready(self) -> bool:
-        return bool(self.body and self.url and self.headers)
+        return bool((self.bodies or self.body) and self.url and self.headers)
 
 
 class TokenBucketLimiter:
@@ -790,10 +860,32 @@ class FoodstuffsScraper:
         self._cf_cookies: list[dict] = []  # cf_clearance cookies from nodriver pre-step
         self._cf_user_agent: Optional[str] = None  # UA nodriver used to solve Turnstile
         # Template saved after first successful browser category — reused for direct POSTs
-        self._direct_template: Optional[dict] = None
+        self._direct_template: Optional[dict] = None    # legacy single body (back-compat)
+        self._direct_bodies: dict[str, dict] = {}       # per-category slug -> body (verbatim replay)
         self._direct_headers: dict[str, str] = {}
         self._direct_url: str = ""
         self._direct_template_store_id: str = ""
+        self._token_request: Optional[dict] = None      # captured token-mint request
+        self._token_seen_version: int = 0               # last refresh version this worker adopted
+        self._captured_token_request: Optional[dict] = None  # discovered during the browser pass
+
+    @property
+    def _has_direct(self) -> bool:
+        """True when this worker can serve categories without the browser."""
+        return bool(self._direct_bodies or self._direct_template)
+
+    def _load_direct_from_state(self) -> None:
+        """Copy the shared template (per-category bodies + token-mint request) into this worker."""
+        ts = self._template_state
+        if not ts:
+            return
+        self._direct_bodies = {k: copy.deepcopy(v) for k, v in ts.bodies.items()}
+        self._direct_template = copy.deepcopy(ts.body) if ts.body else None
+        self._direct_url = ts.url
+        self._direct_headers = dict(ts.headers)
+        self._direct_template_store_id = ts.store_id
+        self._token_request = ts.token_request
+        self._token_seen_version = ts.token_version
 
     # ---- Browser / context ----------------------------------------------
 
@@ -831,13 +923,27 @@ class FoodstuffsScraper:
             logger.info(f"[cf] injected {len(self._cf_cookies)} CF cookies into browser context")
         self._page = await self._context.new_page()
         self._page.set_default_timeout(REQUEST_TIMEOUT_MS)
-        # Bandwidth: block heavy assets we don't need (~70% smaller pages)
-        await self._page.route(
-            "**/*",
-            lambda route, req: (
-                route.abort() if ASSET_BLOCK_RE.search(req.url or "") else route.continue_()
-            ),
-        )
+        # Bandwidth: block heavy assets we don't need (~70% smaller pages). Also piggy-back here
+        # to capture the token-mint request (get-current-user) the first time we see it, so a
+        # mid-run 401 can re-mint the Bearer. Same safe route path — no extra listeners.
+        async def _asset_route(route, req):
+            url = req.url or ""
+            if (self._captured_token_request is None
+                    and self._template_state is not None and not self._template_state.token_request
+                    and "get-current-user" in url):
+                try:
+                    pb = req.post_data_json
+                except Exception:
+                    pb = None
+                self._captured_token_request = {
+                    "url": url, "method": req.method, "headers": dict(req.headers), "body": pb,
+                }
+                logger.info(f"[token] discovered mint endpoint: {req.method} {url}")
+            if ASSET_BLOCK_RE.search(url):
+                await route.abort()
+            else:
+                await route.continue_()
+        await self._page.route("**/*", _asset_route)
 
     async def _refresh_context(self) -> None:
         if self._page:
@@ -1107,27 +1213,25 @@ class FoodstuffsScraper:
                     products.append(p)
         logger.info(f"    parsed {len(products)} products from {len(captured)} responses")
 
-        # Save template for direct-POST fast path after any successful browser category.
-        # Only accept the template when the filters field contains category0SI — otherwise the
-        # regex replacement in _scrape_category_direct will always fail to match.
+        # Save the working request body for THIS category so other branches replay it verbatim
+        # (no category0SI/field parsing → robust to the per-region query encoding). One body per
+        # category slug.
         if products and self._api_post_data and self._api_url and self._api_headers:
-            if not self._direct_template:
-                _alg = self._api_post_data.get("algoliaQuery") or {}
-                _filters = _alg.get("filters", "")
-                if 'category0SI:' in _filters:
-                    self._direct_template = copy.deepcopy(self._api_post_data)
-                    self._direct_url = self._api_url
-                    self._direct_headers = {k: v for k, v in self._api_headers.items()
-                                             if k.lower() not in ("host", "content-length")}
-                    self._direct_template_store_id = self.api_store_id or ""
-                    logger.info(f"[template] direct-POST API url: {self._direct_url}")
-                    if self._template_state and not self._template_state.ready:
-                        self._template_state.save(
-                            self._direct_template,
-                            self._direct_url,
-                            self._direct_headers,
-                            self._direct_template_store_id,
-                        )
+            slug = url.rstrip("/").split("/")[-1]
+            hdrs = {k: v for k, v in self._api_headers.items()
+                    if k.lower() not in ("host", "content-length")}
+            self._direct_bodies[slug] = copy.deepcopy(self._api_post_data)
+            self._direct_url = self._api_url
+            self._direct_headers = hdrs
+            self._direct_template_store_id = self.api_store_id or ""
+            if self._template_state:
+                self._template_state.save_category(
+                    slug, self._direct_bodies[slug], self._direct_url, hdrs,
+                    self._direct_template_store_id,
+                )
+        # Persist the captured token-mint request (once) for mid-run Bearer refresh.
+        if self._captured_token_request and self._template_state and not self._template_state.token_request:
+            self._template_state.save_token_request(self._captured_token_request)
 
         return products, did_paginate
 
@@ -1148,47 +1252,91 @@ class FoodstuffsScraper:
             await asyncio.sleep(0.4 * (i + 1))
         return resp
 
+    async def _refresh_token(self) -> bool:
+        """Re-mint the anonymous Bearer by replaying the captured token-mint request. That endpoint
+        is a www BFF route needing a live cf_clearance, so we refresh CF clearance first and let the
+        context's live cookie ride the call (the captured cookie is stale). One lightweight www /api
+        call — NOT the per-category shop-page nav that caused bans. Shared across workers via the
+        lock + version so concurrent 401s trigger at most one refresh. Never deletes the bodies."""
+        ts = self._template_state
+        if ts is None or not ts.token_request:
+            return False
+        async with ts._lock:
+            # Another worker may have refreshed while we waited on the lock — adopt theirs.
+            if ts.token_version != self._token_seen_version and ts.headers.get("authorization"):
+                self._direct_headers = {**self._direct_headers, "authorization": ts.headers["authorization"]}
+                self._token_seen_version = ts.token_version
+                return True
+            # Ensure a live cf_clearance and inject it — direct workers skipped the CF solve.
+            try:
+                if self._cf_state:
+                    await self._cf_state.ensure_fresh(self.cfg)
+                    self._cf_cookies = list(self._cf_state.cookies)
+                if self._cf_cookies and self._context:
+                    await self._context.add_cookies(self._cf_cookies)
+            except Exception as e:
+                logger.warning(f"[token] could not refresh CF clearance for mint call: {e}")
+            tr = ts.token_request
+            # Drop volatile/stale headers so the context's LIVE cf_clearance & tracing are used.
+            _volatile = {"cookie", "traceparent", "tracestate", "newrelic", "content-length", "host"}
+            hdrs = {k: v for k, v in (tr.get("headers") or {}).items() if k.lower() not in _volatile}
+            try:
+                kwargs = {"method": tr.get("method", "POST"), "headers": hdrs}
+                if tr.get("body") is not None:
+                    kwargs["data"] = tr["body"]
+                resp = await self._page.request.fetch(tr["url"], **kwargs)
+            except Exception as e:
+                logger.warning(f"[token] refresh request failed: {e}")
+                return False
+            if not resp.ok:
+                logger.warning(f"[token] refresh got HTTP {resp.status} — cannot renew Bearer")
+                return False
+            try:
+                new_token = _find_jwt(await resp.json())
+            except Exception:
+                new_token = None
+            if not new_token:
+                logger.warning("[token] refresh response had no JWT — cannot renew")
+                return False
+            ts.set_token(new_token)
+            self._token_seen_version = ts.token_version
+            self._direct_headers = {**self._direct_headers, "authorization": ts.headers["authorization"]}
+            logger.info("[token] Bearer refreshed (single www /api call) — retrying direct POST")
+            return True
+
     async def _scrape_category_direct(self, url: str) -> Optional[list[ScrapedProduct]]:
         """Skip browser navigation — POST directly using the saved template.
 
         Returns a product list on success, or None if a fallback to browser is needed.
         """
-        if not self._direct_template or not self._direct_url or not self._direct_headers:
+        if not self._has_direct or not self._direct_url or not self._direct_headers:
             return None
 
         slug = url.rstrip("/").split("/")[-1]
-        display_name = SLUG_TO_DISPLAY_NAME.get(slug)
-        if not display_name:
-            return None  # unknown slug — browser fallback
 
-        body = copy.deepcopy(self._direct_template)
+        if slug in self._direct_bodies:
+            # Preferred path: replay the exact captured body for this category, swap store only.
+            # No field parsing → works whatever field the (region-specific) bundle used.
+            body = copy.deepcopy(self._direct_bodies[slug])
+            _swap_store_in_body(body, self._direct_template_store_id, self.api_store_id)
+        elif self._direct_template:
+            # Legacy single-body template (old on-disk format): mutate category0SI in filters.
+            display_name = SLUG_TO_DISPLAY_NAME.get(slug)
+            if not display_name:
+                return None
+            body = copy.deepcopy(self._direct_template)
+            _swap_store_in_body(body, self._direct_template_store_id, self.api_store_id)
+            alg = body.get("algoliaQuery")
+            if not alg or "filters" not in alg:
+                logger.warning(f"  [direct] {url} → algoliaQuery/filters missing in template — browser fallback")
+                return None
+            if 'category0SI:"' not in alg["filters"]:
+                logger.warning(f"  [direct] {url} → category0SI not found in filters — browser fallback")
+                return None
+            alg["filters"] = re.sub(r'category0SI:"[^"]*"', f'category0SI:"{display_name}"', alg["filters"])
+        else:
+            return None  # no captured body for this category yet — browser fallback
 
-        # Substitute this branch's storeId — template may have been captured by a different branch
-        if self.api_store_id and self._direct_template_store_id and \
-                self._direct_template_store_id != self.api_store_id:
-            tmpl_sid = self._direct_template_store_id
-            for _f in ("storeId", "store_id"):
-                if _f in body:
-                    body[_f] = self.api_store_id
-            _alg0 = body.get("algoliaQuery") or {}
-            if "filters" in _alg0 and tmpl_sid in _alg0["filters"]:
-                _alg0["filters"] = _alg0["filters"].replace(tmpl_sid, self.api_store_id)
-
-        alg = body.get("algoliaQuery")
-        if not alg or "filters" not in alg:
-            logger.warning(f"  [direct] {url} → algoliaQuery/filters missing in template — browser fallback")
-            return None
-        # Check for PRESENCE of category0SI, not whether the value changed — otherwise the
-        # category the template was captured from (same value) would falsely look "not found"
-        # and needlessly browser-fall-back every run.
-        if 'category0SI:"' not in alg["filters"]:
-            logger.warning(f"  [direct] {url} → category0SI not found in filters — browser fallback")
-            return None
-        alg["filters"] = re.sub(
-            r'category0SI:"[^"]*"',
-            f'category0SI:"{display_name}"',
-            alg["filters"],
-        )
         body["page"] = 0  # API is 0-indexed — page 0 is the first page
 
         category = category_from_url(url)
@@ -1198,14 +1346,18 @@ class FoodstuffsScraper:
             resp = await self._post_with_425_retry(
                 self._direct_url, self._direct_headers, body
             )
+            if resp.status in (401, 403):
+                # Token expired. Re-mint the Bearer via the captured token request and retry ONCE.
+                # The per-category bodies are NOT deleted.
+                if await self._refresh_token():
+                    resp = await self._post_with_425_retry(
+                        self._direct_url, self._direct_headers, body
+                    )
             if not resp.ok:
                 if resp.status == 429 or resp.status >= 500:
                     raise Exception(f"HTTP {resp.status} on direct POST")
                 if resp.status in (401, 403):
-                    logger.warning(f"  [direct] {url} → HTTP {resp.status} — API key stale, invalidating template")
-                    if self._template_state:
-                        self._template_state.invalidate()
-                    self._direct_template = None
+                    logger.warning(f"  [direct] {url} → HTTP {resp.status} — token refresh unavailable/failed, browser fallback")
                     return None
                 logger.warning(f"  [direct] {url} → HTTP {resp.status}")
                 return None
@@ -1432,17 +1584,14 @@ class FoodstuffsScraper:
                  "blocks": 0, "categories_failed": 0, "category_results": []}
 
         # Pre-load template from shared state (set by a previous run or earlier worker)
-        if self._template_state and self._template_state.ready and not self._direct_template:
-            self._direct_template = copy.deepcopy(self._template_state.body)
-            self._direct_url = self._template_state.url
-            self._direct_headers = dict(self._template_state.headers)
-            self._direct_template_store_id = self._template_state.store_id
+        if self._template_state and self._template_state.ready and not self._has_direct:
+            self._load_direct_from_state()
             self._fast_categories = True  # all categories go direct — no browser nav needed
             logger.info("[template] pre-loaded — all categories will use direct POST, browser nav skipped")
 
         # CF solve: use shared state if available (solves once for all workers)
         # Skipped when template is pre-loaded — API calls go to api-prod (no CF)
-        if self._direct_template:
+        if self._has_direct:
             logger.info("[cf] template ready — skipping CF solve for this worker")
         elif self._cf_state:
             await self._cf_state.ensure_fresh(self.cfg)
@@ -1460,6 +1609,12 @@ class FoodstuffsScraper:
         await self._new_context()
         all_products: list[ScrapedProduct] = []
         fast_categories = getattr(self, "_fast_categories", False)
+        # Warm-up capturer: a worker that begins with no usable template must visit
+        # EVERY category through the browser so each body is captured. After the first
+        # category is captured _has_direct flips True; without this latch the remaining
+        # categories would take the direct-only path with no captured body and be
+        # silently skipped — capturing exactly one category per warm-up branch.
+        warmup_capture = not self._has_direct
         try:
             for cat_idx, url in enumerate(random.sample(self.category_urls, len(self.category_urls)), 1):
                 did_paginate = False
@@ -1468,13 +1623,11 @@ class FoodstuffsScraper:
                 exc: Optional[Exception] = None
 
                 # Pick up template if another worker captured it since this worker started
-                if not self._direct_template and self._template_state and self._template_state.ready:
-                    self._direct_template = copy.deepcopy(self._template_state.body)
-                    self._direct_url = self._template_state.url
-                    self._direct_headers = dict(self._template_state.headers)
-                    self._direct_template_store_id = self._template_state.store_id
+                if not self._has_direct and self._template_state and self._template_state.ready:
+                    self._load_direct_from_state()
                     fast_categories = True
                     self._fast_categories = True
+                    warmup_capture = False  # full template now in hand — go direct (ban-safe)
                     logger.info("[template] picked up from shared state mid-run — switching to direct POST")
 
                 # Fast path: direct POST (skip browser) if template is ready and flag is set.
@@ -1482,7 +1635,7 @@ class FoodstuffsScraper:
                 # Browser is only used when the template hasn't been captured yet (first category).
                 self._long_ban_active = False
                 used_direct = False
-                if fast_categories and self._direct_template:
+                if fast_categories and self._has_direct and not warmup_capture:
                     try:
                         direct_products = await self._scrape_category_direct(url)
                         if direct_products is not None:
@@ -1493,7 +1646,7 @@ class FoodstuffsScraper:
                         logger.warning(f"  [direct] {url} error: {e}")
                     # No browser fallback in fast mode — template exists, direct only
 
-                if not used_direct and not (fast_categories and self._direct_template):
+                if not used_direct and not (fast_categories and self._has_direct and not warmup_capture):
                     # Browser: either fast_categories=False, or template not yet captured
                     try:
                         products, did_paginate = await self.scrape_one_category(url)
@@ -1532,7 +1685,7 @@ class FoodstuffsScraper:
                     self._long_ban_active = False
                     try:
                         # In fast mode with template: retry direct POST (no browser)
-                        if fast_categories and self._direct_template:
+                        if fast_categories and self._has_direct and not warmup_capture:
                             direct_products = await self._scrape_category_direct(url)
                             if direct_products is not None:
                                 products = direct_products
