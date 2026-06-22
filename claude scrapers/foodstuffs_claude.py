@@ -2380,13 +2380,36 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
         run_list = branches
         if branches and not template_state.ready:
             logger.info("[warmup] no template on disk — capturing with 1 branch before launching the rest")
-            await run_one(branches[0])
-            run_list = branches[1:]
+            # Try branches one at a time (SERIAL) until one captures the template. A single
+            # transient failure on the warm-up branch (DNS blip, network hiccup) must NOT fall
+            # through to the parallel launch below — N browser workers hitting www at once is a
+            # request burst that trips Cloudflare 429 with retry-after=86400 (24h IP ban). Serial
+            # retry keeps www load to a single worker until the template exists; afterwards every
+            # branch goes direct to api-prod (no www, no CF). If no branch can capture after a few
+            # serial attempts, abort rather than burst — a parallel www burst guarantees the ban.
+            max_warmup = min(len(branches), 5)
+            attempted = 0
+            for b in branches[:max_warmup]:
+                attempted += 1
+                await run_one(b)
+                if template_state.ready:
+                    break
+                logger.warning(
+                    f"[warmup] branch '{b.get('name')}' captured no template "
+                    f"(attempt {attempted}/{max_warmup}, likely a transient error) — "
+                    "retrying serially with the next branch (NOT launching parallel workers)"
+                )
+            run_list = branches[attempted:]
             if template_state.ready:
-                logger.info("[warmup] template captured — remaining branches start in direct-POST mode")
+                logger.info(f"[warmup] template captured after {attempted} branch(es) — "
+                            "remaining branches start in direct-POST mode")
             else:
-                logger.warning("[warmup] first branch did not capture a template — "
-                               "remaining branches may briefly contend (no data impact)")
+                logger.error(
+                    f"[warmup] no template captured after {attempted} serial attempts — aborting "
+                    "before launching parallel browser workers (a parallel www burst would trip "
+                    "Cloudflare's 24h rate ban). Check network/DNS connectivity and re-run."
+                )
+                run_list = []
         await asyncio.gather(*[run_one(b) for b in run_list], return_exceptions=True)
     finally:
         refresh_task.cancel()
