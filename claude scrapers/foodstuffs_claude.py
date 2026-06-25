@@ -1851,6 +1851,28 @@ class FoodstuffsScraper:
             except Exception:
                 pass
 
+    # Transient Postgres errors worth retrying under concurrent writes:
+    # 40P01 deadlock detected, 57014 statement timeout, 40001 serialization failure.
+    _RETRY_PG_CODES = ("40P01", "57014", "40001")
+
+    def _execute_with_retry(self, build, what: str, attempts: int = 4):
+        """Execute a Supabase query (build() returns a fresh query builder) with
+        backoff retries on transient DB errors from concurrent branch writes.
+        Runs in the per-branch executor thread, so time.sleep is safe here."""
+        for attempt in range(1, attempts + 1):
+            try:
+                return build().execute()
+            except Exception as e:
+                err = str(e)
+                if not any(code in err for code in self._RETRY_PG_CODES) or attempt == attempts:
+                    raise
+                delay = min(2.0, 0.3 * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
+                logger.warning(
+                    f"{what}: transient DB error (attempt {attempt}/{attempts}), "
+                    f"retrying in {delay:.1f}s — {err[:120]}"
+                )
+                time.sleep(delay)
+
     def _save_to_supabase(self, products: list[ScrapedProduct], stats: dict) -> None:
         if not products:
             return
@@ -1903,14 +1925,19 @@ class FoodstuffsScraper:
                     row["weight_unit"] = wu
                 rows[p.barcode] = row
 
-            payload = list(rows.values())
+            # Sort by conflict key so all concurrent branches lock rows in the same
+            # order — breaks the cyclic wait that causes 40P01 deadlocks.
+            payload = sorted(rows.values(), key=lambda r: r["barcode"])
             for i in range(0, len(payload), CHUNK):
                 chunk = payload[i : i + CHUNK]
                 try:
                     # ignore_duplicates=False (default) so image_url/brand refresh on each run
-                    self.supabase.table("products").upsert(
-                        chunk, on_conflict="barcode"
-                    ).execute()
+                    self._execute_with_retry(
+                        lambda c=chunk: self.supabase.table("products").upsert(
+                            c, on_conflict="barcode"
+                        ),
+                        f"products upsert chunk {i // CHUNK + 1}",
+                    )
                 except Exception as e:
                     err = str(e)
                     if "products_name_key" in err or "23505" in err:
@@ -1961,7 +1988,9 @@ class FoodstuffsScraper:
                 "scraped_at": p.scraped_at.isoformat(),
             })
 
-        sp_rows = list({r["product_id"]: r for r in sp_rows}.values())
+        # Dedupe by product_id, then sort by it so concurrent branches lock
+        # store_products / parent products rows in a consistent order (anti-deadlock).
+        sp_rows = sorted({r["product_id"]: r for r in sp_rows}.values(), key=lambda r: r["product_id"])
 
         # Snapshot existing prices BEFORE the upsert.
         # Supabase upsert returns post-update values, so reading current_price from the
@@ -2007,9 +2036,12 @@ class FoodstuffsScraper:
         for i in range(0, len(sp_rows), CHUNK):
             chunk = sp_rows[i : i + CHUNK]
             try:
-                r = self.supabase.table("store_products").upsert(
-                    chunk, on_conflict="product_id,store_id"
-                ).execute()
+                r = self._execute_with_retry(
+                    lambda c=chunk: self.supabase.table("store_products").upsert(
+                        c, on_conflict="product_id,store_id"
+                    ),
+                    f"store_products upsert chunk {i // CHUNK + 1}",
+                )
                 total += len(r.data)
             except Exception as e:
                 logger.error(f"store_products upsert chunk {i // CHUNK + 1}: {e}")
@@ -2021,7 +2053,10 @@ class FoodstuffsScraper:
             for i in range(0, len(ph_rows), CHUNK):
                 chunk = ph_rows[i : i + CHUNK]
                 try:
-                    self.supabase.table("price_history").insert(chunk).execute()
+                    self._execute_with_retry(
+                        lambda c=chunk: self.supabase.table("price_history").insert(c),
+                        f"price_history insert chunk {i // CHUNK + 1}",
+                    )
                 except Exception as e:
                     logger.warning(f"price_history insert chunk {i // CHUNK + 1}: {e}")
             logger.info(f"recorded {len(ph_rows)} price changes")
@@ -2038,10 +2073,13 @@ class FoodstuffsScraper:
                 for i in range(0, len(oos_pids), CHUNK):
                     chunk_ids = oos_pids[i : i + CHUNK]
                     try:
-                        self.supabase.table("store_products").update({
-                            "in_stock": False,
-                            "scraped_at": now_iso,
-                        }).eq("store_id", self.branch_id).in_("product_id", chunk_ids).execute()
+                        self._execute_with_retry(
+                            lambda ids=chunk_ids: self.supabase.table("store_products").update({
+                                "in_stock": False,
+                                "scraped_at": now_iso,
+                            }).eq("store_id", self.branch_id).in_("product_id", ids),
+                            f"[oos-sweep] chunk {i // CHUNK + 1}",
+                        )
                         oos_count += len(chunk_ids)
                     except Exception as e:
                         logger.warning(f"[oos-sweep] chunk failed: {e}")
