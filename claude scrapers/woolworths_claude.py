@@ -174,6 +174,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)  # suppress Supabase HTTP request logs
 logger = logging.getLogger("woolworths_claude")
 
 _log_dir = Path(__file__).parent / "logs"
@@ -1099,6 +1100,8 @@ class WoolworthsClaudeScraper:
                     row["brand"] = p.brand
                 if p.image_url:
                     row["image_url"] = p.image_url
+                if p.category:
+                    row["tags"] = [p.category]   # simple category tag
                 if wv is not None:
                     row["weight_value"] = wv
                 if wu is not None:
@@ -1109,8 +1112,10 @@ class WoolworthsClaudeScraper:
             for i in range(0, len(payload), CHUNK):
                 chunk = payload[i : i + CHUNK]
                 try:
+                    # ignore_duplicates=False so image_url / brand / tags refresh on
+                    # existing products (the True setting left them stale forever).
                     self.supabase.table("products").upsert(
-                        chunk, on_conflict="barcode", ignore_duplicates=True
+                        chunk, on_conflict="barcode", ignore_duplicates=False
                     ).execute()
                 except Exception as e:
                     # Likely a name UNIQUE conflict — fall back per-row to resolve.
@@ -1194,13 +1199,17 @@ class WoolworthsClaudeScraper:
                         "new_unit_price": None,
                     })
                     stats["price_changes"] += 1
+            retailer_url = (
+                f"{BASE_URL}/shop/productdetails?stockcode={p.sku}"
+                if p.sku else None
+            )
             sp_rows.append({
                 "product_id": product_id,
                 "store_id": self.branch_id,
                 "sku": p.barcode,
                 "current_price": effective,
-                "unit_price": None,
-                "unit_label": None,
+                "unit_label": p.weight,          # size/pack label e.g. "100g"
+                "retailer_url": retailer_url,
                 "in_stock": p.in_stock,
                 "scraped_at": p.scraped_at.isoformat(),
             })
@@ -1209,6 +1218,10 @@ class WoolworthsClaudeScraper:
         ph_rows = list({r["store_product_id"]: r for r in ph_rows}.values())
 
         # ---------- Phase 5: upsert store_products in chunks ----------
+        # product_id -> store_product_id (seed from existing rows, then upsert responses)
+        sp_id_map: dict[str, str] = {
+            pid: row["id"] for pid, row in existing_map.items() if row.get("id")
+        }
         total_upserted = 0
         for i in range(0, len(sp_rows), CHUNK):
             chunk = sp_rows[i : i + CHUNK]
@@ -1217,11 +1230,17 @@ class WoolworthsClaudeScraper:
                     chunk, on_conflict="product_id,store_id"
                 ).execute()
                 total_upserted += len(r.data)
+                for rr in (r.data or []):
+                    if rr.get("product_id") and rr.get("id"):
+                        sp_id_map[rr["product_id"]] = rr["id"]
             except Exception as e:
                 logger.error(f"store_products upsert chunk {i // CHUNK + 1}: {e}")
                 stats["records_failed"] += len(chunk)
         stats["records_updated"] = total_upserted
         logger.info(f"upserted {total_upserted} store_products rows")
+
+        # ---------- Phase 5b: specials ----------
+        self._save_specials(matched, sp_id_map)
 
         # ---------- Phase 6: insert price_history ----------
         if ph_rows:
@@ -1232,6 +1251,61 @@ class WoolworthsClaudeScraper:
                 except Exception as e:
                     logger.warning(f"price_history insert chunk {i // CHUNK + 1}: {e}")
             logger.info(f"recorded {len(ph_rows)} price changes")
+
+    def _save_specials(self, matched: list[tuple[str, ScrapedProduct]], sp_id_map: dict[str, str]) -> None:
+        """Write specials for products currently on special; deactivate ended ones.
+        Simple is_active model — one active special per store_product."""
+        CHUNK = 200
+        current: dict[str, tuple[float, float]] = {}
+        for product_id, p in matched:
+            if p.special_price and p.special_price < p.price:
+                spid = sp_id_map.get(product_id)
+                if spid:
+                    current[spid] = (p.special_price, p.price)
+
+        active: dict[str, str] = {}  # store_product_id -> special id
+        all_spids = list(sp_id_map.values())
+        for i in range(0, len(all_spids), 100):
+            chunk = all_spids[i : i + 100]
+            try:
+                r = (self.supabase.table("specials")
+                     .select("id,store_product_id")
+                     .in_("store_product_id", chunk).eq("is_active", True).execute())
+                for row in r.data:
+                    active[row["store_product_id"]] = row["id"]
+            except Exception as e:
+                logger.warning(f"specials fetch chunk {i // 100 + 1}: {e}")
+
+        to_deactivate = [active[spid] for spid in active if spid not in current]
+        for i in range(0, len(to_deactivate), 200):
+            chunk = to_deactivate[i : i + 200]
+            try:
+                self.supabase.table("specials").update(
+                    {"is_active": False}).in_("id", chunk).execute()
+            except Exception as e:
+                logger.warning(f"specials deactivate chunk {i // 200 + 1}: {e}")
+
+        to_insert = [
+            {
+                "store_product_id": spid,
+                "special_price": sp,
+                "original_price": orig,
+                "label": f"Save ${orig - sp:.2f}",
+                "is_active": True,
+                "source": "scraped",
+            }
+            for spid, (sp, orig) in current.items() if spid not in active
+        ]
+        for i in range(0, len(to_insert), CHUNK):
+            chunk = to_insert[i : i + CHUNK]
+            try:
+                self.supabase.table("specials").insert(chunk).execute()
+            except Exception as e:
+                logger.warning(f"specials insert chunk {i // CHUNK + 1}: {e}")
+        logger.info(
+            f"specials: {len(to_insert)} new, {len(to_deactivate)} deactivated, "
+            f"{len(current)} on special now"
+        )
 
     def _resolve_chunk_by_name(self, chunk: list[dict], barcode_to_product: dict[str, dict]) -> None:
         """Per-row fallback when a barcode-upsert chunk hits a name UNIQUE conflict."""

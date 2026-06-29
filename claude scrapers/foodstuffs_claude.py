@@ -357,6 +357,19 @@ def category_from_url(url: str) -> str:
     return "other"
 
 
+def extract_fs_image(data: dict) -> Optional[str]:
+    """Real product image from the detail-API response (images.primaryImages).
+    The listing carries no image, so this is the only robust source. Returns
+    None when the product genuinely has no image (primaryImages absent)."""
+    imgs = (data or {}).get("images") or {}
+    primary = imgs.get("primaryImages") or {}
+    for size in ("400px", "500px", "300px", "200px", "100px"):
+        url = primary.get(size)
+        if url:
+            return url
+    return None
+
+
 def _parse_proxy(url: str) -> dict:
     """Parse 'http://user:pass@host:port' → Playwright proxy dict."""
     from urllib.parse import urlparse
@@ -775,11 +788,14 @@ class TokenBucketLimiter:
 # ---------------------------------------------------------------------------
 
 class BarcodeCache:
-    """Simple JSON-file cache: {productId: barcode}. Shared across NW + PS runs."""
+    """JSON-file cache: {productId: {"bc": barcode, "img": image_url}}.
+    Shared across NW + PS runs. Legacy entries may be a bare barcode string
+    (no image) — those are treated as missing an image so the detail call
+    re-runs once and backfills the real image URL from the API."""
 
     def __init__(self, path: Path = CACHE_PATH) -> None:
         self.path = path
-        self._data: dict[str, str] = {}
+        self._data: dict[str, object] = {}
         if path.exists():
             try:
                 self._data = json.loads(path.read_text())
@@ -789,10 +805,42 @@ class BarcodeCache:
         logger.info(f"barcode cache: {len(self._data)} entries loaded from {path.name}")
 
     def get(self, product_id: str) -> Optional[str]:
-        return self._data.get(product_id)
+        """Barcode (handles legacy string entries and new dict entries)."""
+        v = self._data.get(product_id)
+        if isinstance(v, dict):
+            return v.get("bc")
+        return v if isinstance(v, str) else None
+
+    def get_image(self, product_id: str) -> Optional[str]:
+        v = self._data.get(product_id)
+        return v.get("img") if isinstance(v, dict) else None
+
+    def needs_fetch(self, product_id: str) -> bool:
+        """True if we haven't done a detail fetch yet (absent, or legacy
+        barcode-only string entry). Once fetched, the entry is a dict and is
+        settled even if the product has no image — avoids perpetual re-fetch."""
+        v = self._data.get(product_id)
+        if not isinstance(v, dict):
+            return True
+        return not v.get("bc")
 
     def put(self, product_id: str, barcode: str) -> None:
-        self._data[product_id] = barcode
+        """Barcode only (back-compat); preserves any cached image."""
+        v = self._data.get(product_id)
+        if isinstance(v, dict):
+            v["bc"] = barcode
+        else:
+            self._data[product_id] = {"bc": barcode}
+
+    def put_detail(self, product_id: str, barcode: Optional[str], image: Optional[str]) -> None:
+        entry = self._data.get(product_id)
+        if not isinstance(entry, dict):
+            entry = {}
+        if barcode:
+            entry["bc"] = barcode
+        if image:
+            entry["img"] = image
+        self._data[product_id] = entry
 
     def save(self) -> None:
         try:
@@ -1479,12 +1527,13 @@ class FoodstuffsScraper:
         unique_pids: set[str] = {p.product_id for p in products if p.product_id}
         stats["requested"] = len(unique_pids)
 
-        # Apply cache first
+        # Apply cache first. Re-fetch when barcode OR image is missing so the
+        # real image URL backfills as part of the normal run (no separate pass).
         to_fetch: list[str] = []
         cached_map: dict[str, str] = {}
         for pid in unique_pids:
             bc = self.cache.get(pid)
-            if bc:
+            if bc and not self.cache.needs_fetch(pid):
                 cached_map[pid] = bc
                 stats["from_cache"] += 1
             else:
@@ -1510,7 +1559,7 @@ class FoodstuffsScraper:
                 batch = to_fetch[i : i + current_concurrency]
                 i += len(batch)
 
-                async def fetch_one(pid: str) -> tuple[str, Optional[str], int]:
+                async def fetch_one(pid: str) -> tuple[str, Optional[str], Optional[str], int]:
                     url = BARCODE_API.format(store_id=self.api_store_id, pid=pid)
                     try:
                         assert self._page
@@ -1521,17 +1570,18 @@ class FoodstuffsScraper:
                         if resp.ok:
                             data = await resp.json()
                             sku = data.get("sku")
-                            return pid, str(sku) if sku else None, resp.status
-                        return pid, None, resp.status
+                            img = extract_fs_image(data)
+                            return pid, str(sku) if sku else None, img, resp.status
+                        return pid, None, None, resp.status
                     except Exception:
-                        return pid, None, 0
+                        return pid, None, None, 0
 
                 results = await asyncio.gather(*[fetch_one(pid) for pid in batch])
                 batch_429 = 0
-                for pid, bc, status in results:
+                for pid, bc, img, status in results:
                     if bc:
                         result_map[pid] = bc
-                        self.cache.put(pid, bc)
+                        self.cache.put_detail(pid, bc, img)
                         stats["fetched"] += 1
                     elif status == 429:
                         batch_429 += 1
@@ -1556,14 +1606,23 @@ class FoodstuffsScraper:
                 f"in {dt:.1f}s (concurrency ended at {current_concurrency})"
             )
 
-        # Apply to scraped products
+        # Apply to scraped products (barcode + real image URL from the cache)
         applied = 0
+        imaged = 0
         for p in products:
-            if p.product_id and p.product_id in result_map:
-                p.barcode = result_map[p.product_id]
+            if not p.product_id:
+                continue
+            bc = result_map.get(p.product_id) or self.cache.get(p.product_id)
+            if bc:
+                p.barcode = bc
                 applied += 1
+            img = self.cache.get_image(p.product_id)
+            if img:
+                p.image_url = img
+                imaged += 1
         logger.info(
-            f"  [barcode] applied to {applied}/{len(products)} products"
+            f"  [barcode] applied to {applied}/{len(products)} products, "
+            f"{imaged} with image"
         )
         return stats
 
@@ -1919,6 +1978,8 @@ class FoodstuffsScraper:
                     row["brand"] = p.brand
                 if p.image_url:
                     row["image_url"] = p.image_url
+                if p.category:
+                    row["tags"] = [p.category]   # simple category tag
                 if wv is not None:
                     row["weight_value"] = wv
                 if wu is not None:
@@ -1980,10 +2041,15 @@ class FoodstuffsScraper:
         for product_id, p in matched:
             effective = p.special_price if p.special_price else p.price
             new_price_map[product_id] = effective
+            retailer_url = (
+                f"{self.cfg['base_url']}/shop/product/{p.product_id}"
+                if p.product_id else None
+            )
             sp_rows.append({
                 "product_id": product_id, "store_id": self.branch_id,
                 "sku": p.barcode, "current_price": effective,
-                "unit_price": None, "unit_label": None,
+                "unit_label": p.weight,          # size/pack label e.g. "200g"
+                "retailer_url": retailer_url,
                 "in_stock": p.in_stock,
                 "scraped_at": p.scraped_at.isoformat(),
             })
@@ -2032,6 +2098,10 @@ class FoodstuffsScraper:
 
         ph_rows = list({r["store_product_id"]: r for r in ph_rows}.values())
 
+        # product_id -> store_product_id (seed from existing rows, then upsert responses)
+        sp_id_map: dict[str, str] = {
+            pid: row["id"] for pid, row in existing_map.items() if row.get("id")
+        }
         total = 0
         for i in range(0, len(sp_rows), CHUNK):
             chunk = sp_rows[i : i + CHUNK]
@@ -2043,11 +2113,17 @@ class FoodstuffsScraper:
                     f"store_products upsert chunk {i // CHUNK + 1}",
                 )
                 total += len(r.data)
+                for rr in (r.data or []):
+                    if rr.get("product_id") and rr.get("id"):
+                        sp_id_map[rr["product_id"]] = rr["id"]
             except Exception as e:
                 logger.error(f"store_products upsert chunk {i // CHUNK + 1}: {e}")
                 stats["records_failed"] += len(chunk)
         stats["records_updated"] = total
         logger.info(f"upserted {total} store_products rows")
+
+        # ---- specials: write current specials, deactivate ended ones ----
+        self._save_specials(matched, sp_id_map)
 
         if ph_rows:
             for i in range(0, len(ph_rows), CHUNK):
@@ -2086,6 +2162,71 @@ class FoodstuffsScraper:
                 logger.info(f"[oos-sweep] marked {oos_count} products as OOS (not seen this run)")
             else:
                 logger.info("[oos-sweep] all existing products seen — no OOS to mark")
+
+    def _save_specials(self, matched: list[tuple[str, ScrapedProduct]], sp_id_map: dict[str, str]) -> None:
+        """Write specials for products currently on special; deactivate ended ones.
+        Simple is_active model — one active special per store_product."""
+        CHUNK = 500
+        # store_product_id -> (special_price, original_price) for products on special now
+        current: dict[str, tuple[float, float]] = {}
+        for product_id, p in matched:
+            if p.special_price and p.special_price < p.price:
+                spid = sp_id_map.get(product_id)
+                if spid:
+                    current[spid] = (p.special_price, p.price)
+
+        # Existing active specials for this branch's store_products (chunked .in_)
+        active: dict[str, str] = {}  # store_product_id -> special id
+        all_spids = list(sp_id_map.values())
+        for i in range(0, len(all_spids), 100):
+            chunk = all_spids[i : i + 100]
+            try:
+                r = (self.supabase.table("specials")
+                     .select("id,store_product_id")
+                     .in_("store_product_id", chunk).eq("is_active", True).execute())
+                for row in r.data:
+                    active[row["store_product_id"]] = row["id"]
+            except Exception as e:
+                logger.warning(f"specials fetch chunk {i // 100 + 1}: {e}")
+
+        # Deactivate specials no longer on special
+        to_deactivate = [active[spid] for spid in active if spid not in current]
+        for i in range(0, len(to_deactivate), 200):
+            chunk = to_deactivate[i : i + 200]
+            try:
+                self._execute_with_retry(
+                    lambda c=chunk: self.supabase.table("specials").update(
+                        {"is_active": False}).in_("id", c),
+                    f"specials deactivate chunk {i // 200 + 1}",
+                )
+            except Exception as e:
+                logger.warning(f"specials deactivate chunk {i // 200 + 1}: {e}")
+
+        # Insert specials for products newly on special (no active row yet)
+        to_insert = [
+            {
+                "store_product_id": spid,
+                "special_price": sp,
+                "original_price": orig,
+                "label": f"Save ${orig - sp:.2f}",
+                "is_active": True,
+                "source": "scraped",
+            }
+            for spid, (sp, orig) in current.items() if spid not in active
+        ]
+        for i in range(0, len(to_insert), CHUNK):
+            chunk = to_insert[i : i + CHUNK]
+            try:
+                self._execute_with_retry(
+                    lambda c=chunk: self.supabase.table("specials").insert(c),
+                    f"specials insert chunk {i // CHUNK + 1}",
+                )
+            except Exception as e:
+                logger.warning(f"specials insert chunk {i // CHUNK + 1}: {e}")
+        logger.info(
+            f"specials: {len(to_insert)} new, {len(to_deactivate)} deactivated, "
+            f"{len(current)} on special now"
+        )
 
     def _resolve_chunk_by_name(self, chunk: list[dict], barcode_to_product: dict[str, dict]) -> None:
         names = [row["name"] for row in chunk]
