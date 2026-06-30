@@ -47,6 +47,7 @@ from dotenv import load_dotenv
 from patchright.async_api import async_playwright, Browser, BrowserContext, Page
 from supabase import create_client, Client
 from report_client import post_branch_report
+from jsonl_export import write_jsonl, to_cents, clean_record
 
 # ---------------------------------------------------------------------------
 # Paths & env
@@ -336,6 +337,16 @@ class ScrapedProduct:
     in_stock: bool = True
     product_id: Optional[str] = None  # Foodstuffs internal productId (used for barcode lookup)
     scraped_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # --- Scraper Data Contract / rich detail fields (for the JSONL export) ---
+    comparison_price: Optional[float] = None   # was/original/non-member price
+    unit_price: Optional[float] = None         # price per unit_label
+    unit_label: Optional[str] = None           # e.g. "1kg", "100g", "1L", "ea"
+    category_path: Optional[str] = None        # full hierarchy "A > B > C"
+    promo_text: Optional[str] = None           # exact visible promo wording
+    promo_type: Optional[str] = None           # contract promo_type code
+    card_required: bool = False                # loyalty/member card needed?
+    loyalty_program_code: Optional[str] = None # club-plus / everyday-rewards
+    detail: dict = field(default_factory=dict) # rich raw_row (country, nutrition, ...)
 
 
 _WEIGHT_PARSE_RE = re.compile(r"^(\d+\.?\d*)\s*(ml|l|kg|g|oz|lb|pk)$", re.I)
@@ -368,6 +379,43 @@ def extract_fs_image(data: dict) -> Optional[str]:
         if url:
             return url
     return None
+
+
+def category_path_from_trees(trees: object) -> Optional[str]:
+    """Build "level0 > level1 > level2 ..." from a Foodstuffs categoryTrees list.
+    Present in both the listing item and the detail response."""
+    if not isinstance(trees, list) or not trees:
+        return None
+    node = trees[0] or {}
+    parts = []
+    for i in range(6):  # level0..level5, stop at first gap
+        v = node.get(f"level{i}")
+        if not v:
+            break
+        parts.append(str(v))
+    return " > ".join(parts) if parts else None
+
+
+def extract_fs_detail(data: dict) -> dict:
+    """Pull the rich 'product card' fields from a Foodstuffs detail response into
+    a raw_row dict (country/nutrition/ingredients/allergens, per the contract)."""
+    d = data or {}
+    out: dict = {}
+    origin = d.get("originStatement") or d.get("countryOfOrigin")
+    if origin:
+        out["country_of_origin"] = origin
+    for src, key in (
+        ("nutritionalInfo", "nutrition"),
+        ("ingredientStatement", "ingredients"),
+        ("fsIngredientStatement", "ingredients"),
+        ("allergenStatement", "allergens"),
+        ("fsSupplementaryAllergenStatement", "allergen_may_contain"),
+        ("healthStarRating", "health_star_rating"),
+    ):
+        v = d.get(src)
+        if v not in (None, "", [], {}):
+            out.setdefault(key, v)
+    return out
 
 
 def _parse_proxy(url: str) -> dict:
@@ -815,6 +863,20 @@ class BarcodeCache:
         v = self._data.get(product_id)
         return v.get("img") if isinstance(v, dict) else None
 
+    def get_detail(self, product_id: str) -> dict:
+        """Cached STATIC rich fields (country/nutrition/category_path/unit) used as
+        a fallback when this run's detail fetch fails. Never holds volatile price."""
+        v = self._data.get(product_id)
+        return (v.get("det") or {}) if isinstance(v, dict) else {}
+
+    def needs_detail(self, product_id: str) -> bool:
+        """True until we've fetched the static card (barcode + rich detail) once.
+        Specials come from the listing, so detail is fetched cache-miss-only."""
+        v = self._data.get(product_id)
+        if not isinstance(v, dict):
+            return True
+        return not v.get("bc") or not v.get("det")
+
     def needs_fetch(self, product_id: str) -> bool:
         """True if we haven't done a detail fetch yet (absent, or legacy
         barcode-only string entry). Once fetched, the entry is a dict and is
@@ -832,7 +894,8 @@ class BarcodeCache:
         else:
             self._data[product_id] = {"bc": barcode}
 
-    def put_detail(self, product_id: str, barcode: Optional[str], image: Optional[str]) -> None:
+    def put_detail(self, product_id: str, barcode: Optional[str], image: Optional[str],
+                   static: Optional[dict] = None) -> None:
         entry = self._data.get(product_id)
         if not isinstance(entry, dict):
             entry = {}
@@ -840,6 +903,8 @@ class BarcodeCache:
             entry["bc"] = barcode
         if image:
             entry["img"] = image
+        if static:  # static rich fields only (country/nutrition/category/unit)
+            entry["det"] = static
         self._data[product_id] = entry
 
     def save(self) -> None:
@@ -1022,16 +1087,25 @@ class FoodstuffsScraper:
     # ---- Branch resolution ----------------------------------------------
 
     def _resolve_branch(self) -> None:
+        # READ-ONLY resolution: the scraper looks up chain/branch + api_store_id to
+        # know which store to scrape, but must not WRITE. Chain/branch creation is
+        # the importer's job. Create-if-missing upserts are commented out below.
         chain = (
             self.supabase.table("store_chains")
             .select("id").eq("slug", self.cfg["slug"]).execute().data
         )
         if not chain:
-            chain = (
-                self.supabase.table("store_chains")
-                .upsert({"slug": self.cfg["slug"], "name": self.cfg["name"]}, on_conflict="slug")
-                .execute().data
+            # DATABASE WRITE DISABLED — do not create the chain row from the scraper.
+            # chain = (
+            #     self.supabase.table("store_chains")
+            #     .upsert({"slug": self.cfg["slug"], "name": self.cfg["name"]}, on_conflict="slug")
+            #     .execute().data
+            # )
+            logger.error(
+                f"store_chains row missing for slug={self.cfg['slug']} — "
+                f"cannot resolve chain (scraper no longer creates it). Aborting branch."
             )
+            return
         self.chain_id = chain[0]["id"]
 
         if self.branch_id:
@@ -1051,12 +1125,16 @@ class FoodstuffsScraper:
             self.api_store_id = r[0].get("api_store_id")
             return
 
-        # Branch missing — create it (api_store_id will need to be backfilled manually).
-        r = (self.supabase.table("store_branches")
-             .upsert({"chain_id": self.chain_id, "name": self.branch_name},
-                     on_conflict="chain_id,name").execute().data)
-        self.branch_id = r[0]["id"]
-        self.api_store_id = r[0].get("api_store_id")
+        # DATABASE WRITE DISABLED — do not create the branch row from the scraper.
+        # r = (self.supabase.table("store_branches")
+        #      .upsert({"chain_id": self.chain_id, "name": self.branch_name},
+        #              on_conflict="chain_id,name").execute().data)
+        # self.branch_id = r[0]["id"]
+        # self.api_store_id = r[0].get("api_store_id")
+        logger.error(
+            f"store_branches row missing for {self.branch_name!r} (chain {self.chain_id}) — "
+            f"scraper no longer creates it; branch unresolved, will be skipped."
+        )
 
     # ---- Random delay ----------------------------------------------------
 
@@ -1475,17 +1553,52 @@ class FoodstuffsScraper:
         if price <= 0:
             return None
 
-        special = None
-        special_field = None
-        for key in ("salePrice", "promotionPrice", "specialPrice"):
-            v = sp.get(key)
+        # Specials come from the listing 'promotions' array (per-store, fresh) —
+        # NOT from the detail page. singlePrice.price is the regular price; the
+        # promotion's rewardValue (cents) is the deal price.
+        special = comparison = promo_type = promo_text = loyalty_code = None
+        card_required = False
+        promos = item.get("promotions") or []
+        if promos:
+            promo = next((p for p in promos if p.get("bestPromotion")), promos[0])
+            reward_type = promo.get("rewardType")
+            reward_value = promo.get("rewardValue")
+            threshold = promo.get("threshold") or 1
+            card_required = bool(promo.get("cardDependencyFlag"))
             try:
-                if v and float(v) < float(price_cents):
-                    special = float(v) / 100
-                    special_field = key
-                    break
+                rv = float(reward_value) / 100 if reward_value else None
             except (TypeError, ValueError):
-                continue
+                rv = None
+            if threshold > 1 and rv:
+                # multibuy: rewardValue is the total price for `threshold` units
+                promo_type = "multibuy_fixed_price"
+                promo_text = f"{threshold} for ${rv:.2f}"
+            elif reward_type == "NEW_PRICE" and rv is not None and rv < price:
+                special = rv
+                comparison = price                 # singlePrice.price = regular
+                promo_type = "member_price" if card_required else "special"
+                promo_text = f"Club Deal ${rv:.2f}" if card_required else f"Special ${rv:.2f}"
+            elif rv is not None and rv < price:
+                special = rv
+                comparison = price
+                promo_type = "special"
+                promo_text = f"Special ${rv:.2f}"
+            if card_required and promo_type:
+                loyalty_code = "club-plus"
+
+        # Unit price + label (free from the listing's comparativePrice)
+        comp = sp.get("comparativePrice") or {}
+        unit_price = None
+        try:
+            ppu = comp.get("pricePerUnit")
+            if ppu:
+                unit_price = float(ppu) / 100
+        except (TypeError, ValueError):
+            unit_price = None
+        unit_label = comp.get("measureDescription") or comp.get("unitQuantityUom") or None
+
+        # Full category hierarchy (listing carries categoryTrees too)
+        category_path = category_path_from_trees(item.get("categoryTrees"))
 
         # Stock
         avail = (item.get("availability") or item.get("stockLevel") or "").lower() if isinstance(
@@ -1511,6 +1624,14 @@ class FoodstuffsScraper:
             weight=display_name,
             in_stock=in_stock,
             product_id=str(item.get("productId") or item.get("id") or "") or None,
+            unit_price=unit_price,
+            unit_label=unit_label,
+            category_path=category_path,
+            comparison_price=comparison,
+            promo_type=promo_type,
+            promo_text=promo_text,
+            card_required=card_required,
+            loyalty_program_code=loyalty_code,
         )
 
     # ---- Parallel barcode enrichment with adaptive concurrency ----------
@@ -1527,24 +1648,18 @@ class FoodstuffsScraper:
         unique_pids: set[str] = {p.product_id for p in products if p.product_id}
         stats["requested"] = len(unique_pids)
 
-        # Apply cache first. Re-fetch when barcode OR image is missing so the
-        # real image URL backfills as part of the normal run (no separate pass).
-        to_fetch: list[str] = []
-        cached_map: dict[str, str] = {}
-        for pid in unique_pids:
-            bc = self.cache.get(pid)
-            if bc and not self.cache.needs_fetch(pid):
-                cached_map[pid] = bc
-                stats["from_cache"] += 1
-            else:
-                to_fetch.append(pid)
+        # Detail provides STATIC fields only: barcode, image, and the product
+        # card (country/nutrition/category). Specials come from the listing's
+        # 'promotions' (parsed in _parse_item), so detail is fetched cache-miss
+        # only — fetch once per product, then served from cache.
+        to_fetch: list[str] = [pid for pid in unique_pids if self.cache.needs_detail(pid)]
         logger.info(
-            f"  [barcode] {stats['from_cache']}/{stats['requested']} from cache, "
-            f"{len(to_fetch)} need API fetch"
+            f"  [detail] {len(unique_pids) - len(to_fetch)}/{len(unique_pids)} cached, "
+            f"{len(to_fetch)} need API fetch (barcode/image/card)"
         )
 
-        # Adaptive parallel fetch
-        result_map: dict[str, str] = dict(cached_map)
+        # Adaptive parallel fetch. detail_map[pid] = parsed fresh detail this run.
+        detail_map: dict[str, dict] = {}
         if to_fetch:
             current_concurrency = ENRICH_CONCURRENCY_INITIAL
             consecutive_429 = 0
@@ -1559,29 +1674,25 @@ class FoodstuffsScraper:
                 batch = to_fetch[i : i + current_concurrency]
                 i += len(batch)
 
-                async def fetch_one(pid: str) -> tuple[str, Optional[str], Optional[str], int]:
+                async def fetch_one(pid: str) -> tuple[str, Optional[dict], int]:
                     url = BARCODE_API.format(store_id=self.api_store_id, pid=pid)
                     try:
                         assert self._page
-                        # try this if hitting many blocks
-                        # if self._rate_limiter:
-                        #     await self._rate_limiter.acquire()
                         resp = await self._page.request.get(url, headers=headers)
                         if resp.ok:
                             data = await resp.json()
-                            sku = data.get("sku")
-                            img = extract_fs_image(data)
-                            return pid, str(sku) if sku else None, img, resp.status
-                        return pid, None, None, resp.status
+                            return pid, self._parse_detail(data), resp.status
+                        return pid, None, resp.status
                     except Exception:
-                        return pid, None, None, 0
+                        return pid, None, 0
 
                 results = await asyncio.gather(*[fetch_one(pid) for pid in batch])
                 batch_429 = 0
-                for pid, bc, img, status in results:
-                    if bc:
-                        result_map[pid] = bc
-                        self.cache.put_detail(pid, bc, img)
+                for pid, det, status in results:
+                    if det is not None:
+                        detail_map[pid] = det
+                        self.cache.put_detail(pid, det.get("barcode"), det.get("image"),
+                                              static=det.get("static_cache"))
                         stats["fetched"] += 1
                     elif status == 429:
                         batch_429 += 1
@@ -1593,7 +1704,7 @@ class FoodstuffsScraper:
                     new_c = max(ENRICH_CONCURRENCY_MIN, current_concurrency // 2)
                     if new_c != current_concurrency:
                         logger.warning(
-                            f"  [barcode] {batch_429} 429s in batch → concurrency "
+                            f"  [detail] {batch_429} 429s in batch → concurrency "
                             f"{current_concurrency} → {new_c}"
                         )
                         current_concurrency = new_c
@@ -1602,29 +1713,132 @@ class FoodstuffsScraper:
                     consecutive_429 = 0
             dt = time.time() - t0
             logger.info(
-                f"  [barcode] enriched {stats['fetched']}/{len(to_fetch)} via API "
+                f"  [detail] fetched {stats['fetched']}/{len(to_fetch)} via API "
                 f"in {dt:.1f}s (concurrency ended at {current_concurrency})"
             )
 
-        # Apply to scraped products (barcode + real image URL from the cache)
-        applied = 0
-        imaged = 0
+        # Apply STATIC fields to products: fresh detail this run, else cache
+        # fallback. Specials are already set from the listing in _parse_item.
+        applied = imaged = 0
         for p in products:
             if not p.product_id:
                 continue
-            bc = result_map.get(p.product_id) or self.cache.get(p.product_id)
-            if bc:
-                p.barcode = bc
-                applied += 1
-            img = self.cache.get_image(p.product_id)
-            if img:
-                p.image_url = img
-                imaged += 1
+            det = detail_map.get(p.product_id)
+            if det:
+                if det.get("barcode"):
+                    p.barcode = det["barcode"]; applied += 1
+                if det.get("image"):
+                    p.image_url = det["image"]; imaged += 1
+                self._apply_detail(p, det)
+            else:
+                bc = self.cache.get(p.product_id)
+                if bc:
+                    p.barcode = bc; applied += 1
+                img = self.cache.get_image(p.product_id)
+                if img:
+                    p.image_url = img; imaged += 1
+                self._apply_static(p, self.cache.get_detail(p.product_id))
+        stats["from_cache"] = stats["requested"] - stats["fetched"]
+        specialed = sum(1 for p in products if p.special_price)
+        carded = sum(1 for p in products if p.card_required)
         logger.info(
-            f"  [barcode] applied to {applied}/{len(products)} products, "
-            f"{imaged} with image"
+            f"  [detail] applied: {applied} barcode, {imaged} image, "
+            f"{specialed} special (listing), {carded} member-card"
         )
         return stats
+
+    @staticmethod
+    def _parse_detail(data: dict) -> dict:
+        """Parse a Foodstuffs detail response into the fields the JSONL needs.
+        Separates volatile (member/non-member price) from static-cacheable."""
+        sku = data.get("sku")
+        # comparativePricePerUnit is cents; measure description is the unit label
+        upu = data.get("comparativePricePerUnit")
+        unit_price = (float(upu) / 100) if isinstance(upu, (int, float)) else None
+        unit_label = data.get("comparativeUnitMeasureDescription") or None
+        category_path = category_path_from_trees(data.get("categoryTrees"))
+        static_cache = {
+            "rich": extract_fs_detail(data),
+            "unit_price": unit_price,
+            "unit_label": unit_label,
+            "category_path": category_path,
+        }
+        return {
+            "barcode": str(sku) if sku else None,
+            "image": extract_fs_image(data),
+            "member_price": data.get("price"),               # cents (loyalty/club)
+            "nonmember_price": data.get("nonLoyaltyCardPrice"),  # cents (non-member)
+            "unit_price": unit_price,
+            "unit_label": unit_label,
+            "category_path": category_path,
+            "rich": static_cache["rich"],
+            "static_cache": static_cache,
+        }
+
+    def _apply_detail(self, p: "ScrapedProduct", det: dict) -> None:
+        """Apply a freshly fetched detail dict — STATIC fields only. Specials are
+        parsed from the listing 'promotions', not here."""
+        self._apply_static(p, {
+            "unit_price": det.get("unit_price"), "unit_label": det.get("unit_label"),
+            "category_path": det.get("category_path"), "rich": det.get("rich"),
+        })
+
+    @staticmethod
+    def _apply_static(p: "ScrapedProduct", st: dict) -> None:
+        """Apply static fields (from fresh detail or cache fallback)."""
+        if not st:
+            return
+        if st.get("unit_price") is not None:
+            p.unit_price = st["unit_price"]
+        if st.get("unit_label"):
+            p.unit_label = st["unit_label"]
+        if st.get("category_path"):
+            p.category_path = st["category_path"]
+        if st.get("rich"):
+            p.detail = st["rich"]
+
+    # ---- JSONL export (Scraper Data Contract — replaces DB writes) --------
+
+    def _build_observation(self, p: "ScrapedProduct") -> Optional[dict]:
+        """Map one ScrapedProduct to a contract observation record."""
+        if not p.raw_name or p.price is None or p.price <= 0:
+            return None
+        on_special = bool(p.special_price and p.special_price < p.price)
+        current = p.special_price if on_special else p.price
+        comparison = p.comparison_price if on_special else None
+        product_url = (
+            f"{self.cfg['base_url']}/shop/product/{p.product_id}" if p.product_id else None
+        )
+        rec = {
+            "source_product_id": p.product_id,
+            "retailer_sku": p.product_id,         # FS has no SKU distinct from productId
+            "barcode": p.barcode,
+            "raw_name": p.raw_name,
+            "clean_name": p.clean_name,
+            "brand": p.brand,
+            "category_path": p.category_path or p.category,
+            "size": p.weight,
+            "current_price_cents": to_cents(current),
+            "comparison_price_cents": to_cents(comparison),
+            "unit_price_cents": to_cents(p.unit_price),
+            "unit_label": p.unit_label,
+            "stock_status": "in_stock" if p.in_stock else "out_of_stock",
+            "promo_text": p.promo_text,
+            "promo_type": p.promo_type,
+            "card_required": p.card_required or None,
+            "required_loyalty_program_code": p.loyalty_program_code,
+            "product_url": product_url,
+            "image_url": p.image_url,
+            "observed_at": p.scraped_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        if p.detail:
+            rec["raw_row"] = p.detail
+        return clean_record(rec)
+
+    def _export_jsonl(self, products: list["ScrapedProduct"]) -> None:
+        """Stage 1 of the contract: write one JSONL file for this branch+run."""
+        records = [r for r in (self._build_observation(p) for p in products) if r]
+        write_jsonl(self.chain_key, self.branch_name, records)
 
     # ---- Run --------------------------------------------------------------
 
@@ -1799,10 +2013,15 @@ class FoodstuffsScraper:
                 stats["barcodes_fetched"] = bstats["fetched"]
                 self.cache.save()  # persist after each branch run
 
-            if not self.dry_run:
-                await loop.run_in_executor(None, self._save_to_supabase, all_products, stats)
-            else:
-                logger.info("DRY RUN — skipping Supabase writes")
+            # --- DATABASE WRITES DISABLED (two-stage contract) ---
+            # The scraper no longer writes to Supabase. It emits one JSONL file per
+            # branch+run; pico-prod/import_products.py owns all DB writes. The old
+            # direct write is kept (commented) for reference, do not re-enable.
+            # if not self.dry_run:
+            #     await loop.run_in_executor(None, self._save_to_supabase, all_products, stats)
+            # else:
+            #     logger.info("DRY RUN — skipping Supabase writes")
+            await loop.run_in_executor(None, self._export_jsonl, all_products)
 
             status = (
                 "failed" if (stats["records_failed"] and not stats["records_updated"])
@@ -1863,19 +2082,20 @@ class FoodstuffsScraper:
     # ---- Supabase writes (mirrors woolworths_claude.py) -----------------
 
     def _start_run(self) -> Optional[str]:
-        if self.dry_run:
-            return None
-        try:
-            r = self.supabase.table("scraper_runs").insert({
-                "chain_id": self.chain_id,
-                "branch_id": self.branch_id,
-                "status": "running",
-                "started_at": datetime.now(timezone.utc).isoformat(),
-            }).execute()
-            return r.data[0]["id"]
-        except Exception as e:
-            logger.warning(f"could not insert scraper_runs row: {e}")
-            return None
+        # DATABASE WRITE DISABLED — run tracking moves to ingest.import_runs on the
+        # import side. Returning None makes _update_run/_end_run no-op safely.
+        return None
+        # try:
+        #     r = self.supabase.table("scraper_runs").insert({
+        #         "chain_id": self.chain_id,
+        #         "branch_id": self.branch_id,
+        #         "status": "running",
+        #         "started_at": datetime.now(timezone.utc).isoformat(),
+        #     }).execute()
+        #     return r.data[0]["id"]
+        # except Exception as e:
+        #     logger.warning(f"could not insert scraper_runs row: {e}")
+        #     return None
 
     def _update_run(self, run_id: Optional[str], **fields) -> None:
         if not run_id:

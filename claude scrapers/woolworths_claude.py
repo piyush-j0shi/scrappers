@@ -57,6 +57,7 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from supabase import create_client, Client
 from report_client import post_branch_report
+from jsonl_export import write_jsonl, to_cents, clean_record
 
 # ---------------------------------------------------------------------------
 # Paths & env
@@ -76,6 +77,11 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://www.woolworths.co.nz"
+# Per-product detail endpoint — source of the full card (origins/nutrition/
+# health-star/breadcrumb) which the listing does not carry.
+WW_DETAIL_API = BASE_URL + "/api/v1/products/{sku}"
+WW_DETAIL_CACHE_PATH = Path(__file__).resolve().parent / ".woolworths_detail_cache.json"
+WW_DETAIL_CONCURRENCY = 5  # low — WW is Akamai-protected and session-pinned
 
 # Categories cover the full /shop/browse top-level taxonomy (verified 2026-05).
 CATEGORY_URLS: list[str] = [
@@ -207,9 +213,97 @@ class ScrapedProduct:
     in_stock: bool = True
     sku: Optional[str] = None          # Woolworths internal SKU
     scraped_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # --- Scraper Data Contract / rich detail fields (for the JSONL export) ---
+    comparison_price: Optional[float] = None   # was/original price
+    unit_price: Optional[float] = None         # price per unit_label (cupPrice)
+    unit_label: Optional[str] = None           # cupMeasure e.g. "100g", "1L"
+    category_path: Optional[str] = None        # full breadcrumb "Dept > Aisle > Shelf"
+    promo_text: Optional[str] = None
+    promo_type: Optional[str] = None
+    card_required: bool = False
+    loyalty_program_code: Optional[str] = None # everyday-rewards
+    detail: dict = field(default_factory=dict) # rich raw_row (country, nutrition, ...)
 
 
 _WEIGHT_PARSE_RE = re.compile(r"^(\d+\.?\d*)\s*(ml|l|kg|g|oz|lb|pk)$", re.I)
+
+
+def breadcrumb_to_path(bc: object) -> Optional[str]:
+    """Build "Department > Aisle > Shelf" from a Woolworths breadcrumb object."""
+    if not isinstance(bc, dict):
+        return None
+    parts = []
+    for level in ("department", "aisle", "shelf", "subShelf"):
+        node = bc.get(level)
+        if isinstance(node, dict) and node.get("name"):
+            parts.append(str(node["name"]))
+    return " > ".join(parts) if parts else None
+
+
+def parse_ww_detail(data: dict) -> dict:
+    """Extract WW static rich card (country/nutrition/breadcrumb) from a detail
+    response. Returns {"category_path": str|None, "rich": {...}}."""
+    d = data or {}
+    rich: dict = {}
+    origins = d.get("origins")
+    if origins:
+        rich["country_of_origin"] = "; ".join(origins) if isinstance(origins, list) else origins
+    for src, key in (
+        ("nutrition", "nutrition"),
+        ("ingredients", "ingredients"),
+        ("allergens", "allergens"),
+        ("claims", "claims"),
+        ("healthStarRating", "health_star_rating"),
+        ("warnings", "warnings"),
+        ("servingSuggestion", "serving_suggestion"),
+    ):
+        v = d.get(src)
+        if v not in (None, "", [], {}):
+            rich[key] = v
+    return {"category_path": breadcrumb_to_path(d.get("breadcrumb")), "rich": rich}
+
+
+class WWDetailCache:
+    """Persistent cache of WW STATIC rich fields keyed by stockcode. The listing
+    already carries fresh per-store price/special, so detail is fetched once per
+    product (cache-miss only) purely for the static card — keeps cost bounded."""
+
+    def __init__(self, path: Path = WW_DETAIL_CACHE_PATH) -> None:
+        self.path = path
+        self._data: dict[str, dict] = {}
+        if path.exists():
+            try:
+                self._data = json.loads(path.read_text())
+            except Exception as e:
+                logger.warning(f"ww detail cache read failed ({e}) — starting empty")
+        logger.info(f"ww detail cache: {len(self._data)} entries loaded")
+
+    def get(self, sku: str) -> dict:
+        return self._data.get(sku) or {}
+
+    def has(self, sku: str) -> bool:
+        return sku in self._data
+
+    def put(self, sku: str, det: dict) -> None:
+        self._data[sku] = det
+
+    def save(self) -> None:
+        try:
+            self.path.write_text(json.dumps(self._data, ensure_ascii=False))
+            logger.info(f"ww detail cache: saved {len(self._data)} entries")
+        except Exception as e:
+            logger.warning(f"ww detail cache save failed: {e}")
+
+
+_WW_DETAIL_CACHE: Optional["WWDetailCache"] = None
+
+
+def get_ww_detail_cache() -> "WWDetailCache":
+    """Process-wide singleton so concurrent branch workers share one cache file."""
+    global _WW_DETAIL_CACHE
+    if _WW_DETAIL_CACHE is None:
+        _WW_DETAIL_CACHE = WWDetailCache()
+    return _WW_DETAIL_CACHE
 
 
 def parse_weight_fields(weight_str: Optional[str]) -> tuple[Optional[float], Optional[str]]:
@@ -227,6 +321,40 @@ def category_from_url(url: str) -> str:
         if f"/{slug}" in url:
             return cat
     return "other"
+
+
+def url_with_page(url: str, page_num: int) -> str:
+    """Return ``url`` with its ``page`` query param set to ``page_num``.
+
+    The Woolworths browse template carries no ``page=`` param (page 1 is implicit),
+    so a bare ``re.sub`` would be a no-op and every "page" would re-request page 1.
+    This appends ``page=`` when it is absent so pagination actually advances.
+    """
+    if re.search(r"\bpage=\d+\b", url):
+        return re.sub(r"\bpage=\d+\b", f"page={page_num}", url)
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}page={page_num}"
+
+
+def dedupe_by_sku(products: list) -> list:
+    """Drop duplicate products (same Woolworths SKU/stockcode), keeping first seen.
+
+    A safety net against pagination returning the same page repeatedly: if the
+    page param ever fails to advance again, this caps the damage and surfaces it
+    via the caller's duplicate-ratio warning instead of silently inflating counts.
+    """
+    seen: set = set()
+    out = []
+    for p in products:
+        key = getattr(p, "sku", None) or getattr(p, "barcode", None)
+        if key is None:
+            out.append(p)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
 
 
 def _parse_proxy(url: str) -> dict:
@@ -315,6 +443,7 @@ class WoolworthsClaudeScraper:
         self.auto_bootstrap = auto_bootstrap
         self.max_session_age_min = max_session_age_min
         self.fast_categories: bool = False
+        self._detail_cache = get_ww_detail_cache()  # shared static rich-card cache
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
@@ -472,7 +601,9 @@ class WoolworthsClaudeScraper:
         return True
 
     def _resolve_branch(self) -> None:
-        """Look up chain_id and branch_id from store_chains / store_branches."""
+        """READ-ONLY: look up chain_id / branch_id from store_chains / store_branches.
+        The scraper must not WRITE — chain/branch creation is the importer's job.
+        Create-if-missing upserts are commented out below."""
         chain = (
             self.supabase.table("store_chains")
             .select("id")
@@ -481,13 +612,18 @@ class WoolworthsClaudeScraper:
             .data
         )
         if not chain:
-            # First-ever scrape — create the chain row.
-            chain = (
-                self.supabase.table("store_chains")
-                .upsert({"slug": WOOLWORTHS_CHAIN_SLUG, "name": "Woolworths"}, on_conflict="slug")
-                .execute()
-                .data
+            # DATABASE WRITE DISABLED — do not create the chain row from the scraper.
+            # chain = (
+            #     self.supabase.table("store_chains")
+            #     .upsert({"slug": WOOLWORTHS_CHAIN_SLUG, "name": "Woolworths"}, on_conflict="slug")
+            #     .execute()
+            #     .data
+            # )
+            logger.error(
+                f"store_chains row missing for slug={WOOLWORTHS_CHAIN_SLUG} — "
+                f"cannot resolve chain (scraper no longer creates it). Aborting branch."
             )
+            return
         self.chain_id = chain[0]["id"]
 
         if self.branch_id:
@@ -514,18 +650,21 @@ class WoolworthsClaudeScraper:
             self.branch_id = r[0]["id"]
             return
 
-        # Branch row missing — create it. (Sessions key on the new branch_id, so a
-        # session may not yet exist; scrape will fall back to no-session pricing.)
-        r = (
-            self.supabase.table("store_branches")
-            .upsert(
-                {"chain_id": self.chain_id, "name": self.branch_name},
-                on_conflict="chain_id,name",
-            )
-            .execute()
-            .data
+        # DATABASE WRITE DISABLED — do not create the branch row from the scraper.
+        # r = (
+        #     self.supabase.table("store_branches")
+        #     .upsert(
+        #         {"chain_id": self.chain_id, "name": self.branch_name},
+        #         on_conflict="chain_id,name",
+        #     )
+        #     .execute()
+        #     .data
+        # )
+        # self.branch_id = r[0]["id"]
+        logger.error(
+            f"store_branches row missing for {self.branch_name!r} (chain {self.chain_id}) — "
+            f"scraper no longer creates it; branch unresolved, will be skipped."
         )
-        self.branch_id = r[0]["id"]
 
     # ---- Network capture -------------------------------------------------
 
@@ -624,10 +763,7 @@ class WoolworthsClaudeScraper:
                     if k.lower() not in ("host", "content-length")
                 }
                 for page_num in range(2, total_pages + 1):
-                    page_url = re.sub(r"\bpage=\d+\b", f"page={page_num}", self._api_paginated_url)
-                    if "page=" not in self._api_paginated_url:
-                        sep = "&" if "?" in page_url else "?"
-                        page_url = f"{page_url}{sep}page={page_num}"
+                    page_url = url_with_page(self._api_paginated_url, page_num)
                     try:
                         resp = await self._page.request.get(page_url, headers=headers)
                         if resp.ok:
@@ -672,6 +808,7 @@ class WoolworthsClaudeScraper:
                 if p:
                     products.append(p)
 
+        products = dedupe_by_sku(products)
         logger.info(f"    parsed {len(products)} products from {len(captured)} responses")
         return products, did_paginate, len(captured)
 
@@ -719,7 +856,7 @@ class WoolworthsClaudeScraper:
             _sem = asyncio.Semaphore(3)
 
             async def _fetch_page(page_num: int) -> tuple[int, Optional[dict]]:
-                page_url = re.sub(r"\bpage=\d+\b", f"page={page_num}", direct_url)
+                page_url = url_with_page(direct_url, page_num)
                 async with _sem:
                     try:
                         r = await self._page.request.get(page_url, headers=self._fast_headers)
@@ -762,6 +899,14 @@ class WoolworthsClaudeScraper:
             logger.warning(f"  [fast] {url} → 0 products — browser fallback")
             return None
 
+        raw_count = len(products)
+        products = dedupe_by_sku(products)
+        if raw_count > len(products) * 1.5 and total_pages > 1:
+            logger.warning(
+                f"  [fast] {url}: {raw_count} rows collapsed to {len(products)} unique "
+                f"— pagination may not be advancing")
+            return None  # fall back to the browser path rather than trust bad data
+
         pages_label = f"{total_pages}p" if total_pages > 1 else ""
         logger.info(f"  [fast] {url}  {len(products)} products {pages_label}".rstrip())
         return products
@@ -796,8 +941,34 @@ class WoolworthsClaudeScraper:
         except (TypeError, ValueError):
             special = None
 
+        # Promo type + member tag from the listing price flags
+        promo_type = promo_text = loyalty_code = None
+        card_required = False
+        comparison = None
+        if special is not None:
+            comparison = price_f  # original / was price
+            is_club = bool(price_data.get("isClubPrice"))
+            if is_club:
+                promo_type = "member_price"
+                card_required = True
+                loyalty_code = "everyday-rewards"
+            elif special <= price_f / 2 + 0.001:
+                promo_type = "half_price"
+            else:
+                promo_type = "special"
+            save = price_data.get("savePrice")
+            if save:
+                promo_text = f"Save ${float(save):.2f}"
+
         size = item.get("size") or {}
         weight = size.get("volumeSize") or None
+        # Unit price + label (free from the listing's cup price)
+        try:
+            cup = size.get("cupPrice")
+            unit_price = float(cup) if cup else None
+        except (TypeError, ValueError):
+            unit_price = None
+        unit_label = size.get("cupMeasure") or None
 
         # Stock — Woolworths exposes a few possible signals; treat anything explicitly OOS as False.
         availability = (
@@ -827,7 +998,108 @@ class WoolworthsClaudeScraper:
             barcode=item.get("barcode") or None,
             in_stock=in_stock,
             sku=str(item.get("sku") or item.get("productId") or "") or None,
+            comparison_price=comparison,
+            unit_price=unit_price,
+            unit_label=unit_label,
+            promo_type=promo_type,
+            promo_text=promo_text,
+            card_required=card_required,
+            loyalty_program_code=loyalty_code,
         )
+
+    # ---- Detail enrichment (static rich card, cache-backed) --------------
+
+    async def enrich_details(self, products: list[ScrapedProduct]) -> None:
+        """Fetch the static product card (origins/nutrition/health-star/breadcrumb)
+        per product from the detail endpoint. Cache-miss only (the listing already
+        carries fresh price/special). Best-effort — failures just omit rich fields."""
+        skus = {p.sku for p in products if p.sku}
+        to_fetch = [s for s in skus if not self._detail_cache.has(s)]
+        logger.info(
+            f"  [detail] {len(skus) - len(to_fetch)}/{len(skus)} cached, "
+            f"{len(to_fetch)} need API fetch"
+        )
+        headers = {
+            k: v for k, v in (self._api_headers or self._fast_headers or {}).items()
+            if k.lower() not in ("host", "content-length")
+        }
+        fetched = 0
+        if to_fetch and self._page:
+            i = 0
+            while i < len(to_fetch):
+                batch = to_fetch[i : i + WW_DETAIL_CONCURRENCY]
+                i += len(batch)
+
+                async def fetch_one(sku: str) -> tuple[str, Optional[dict]]:
+                    try:
+                        assert self._page
+                        resp = await self._page.request.get(
+                            WW_DETAIL_API.format(sku=sku), headers=headers)
+                        if resp.ok:
+                            return sku, parse_ww_detail(await resp.json())
+                        return sku, None
+                    except Exception:
+                        return sku, None
+
+                for sku, det in await asyncio.gather(*[fetch_one(s) for s in batch]):
+                    if det is not None:
+                        self._detail_cache.put(sku, det)
+                        fetched += 1
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+
+        applied = 0
+        for p in products:
+            if not p.sku:
+                continue
+            det = self._detail_cache.get(p.sku)
+            if det.get("category_path"):
+                p.category_path = det["category_path"]
+            if det.get("rich"):
+                p.detail = det["rich"]
+                applied += 1
+        logger.info(f"  [detail] fetched {fetched}, applied rich card to {applied} products")
+
+    # ---- JSONL export (Scraper Data Contract — replaces DB writes) --------
+
+    def _build_observation(self, p: ScrapedProduct) -> Optional[dict]:
+        if not p.raw_name or p.price is None or p.price <= 0:
+            return None
+        on_special = bool(p.special_price and p.special_price < p.price)
+        current = p.special_price if on_special else p.price
+        comparison = p.comparison_price if on_special else None
+        product_url = (
+            f"{BASE_URL}/shop/productdetails?stockcode={p.sku}" if p.sku else None
+        )
+        rec = {
+            "source_product_id": p.sku,
+            "retailer_sku": p.sku,
+            "barcode": p.barcode,
+            "raw_name": p.raw_name,
+            "clean_name": p.clean_name,
+            "brand": p.brand,
+            "category_path": p.category_path or p.category,
+            "size": p.weight,
+            "current_price_cents": to_cents(current),
+            "comparison_price_cents": to_cents(comparison),
+            "unit_price_cents": to_cents(p.unit_price),
+            "unit_label": p.unit_label,
+            "stock_status": "in_stock" if p.in_stock else "out_of_stock",
+            "promo_text": p.promo_text,
+            "promo_type": p.promo_type,
+            "card_required": p.card_required or None,
+            "required_loyalty_program_code": p.loyalty_program_code,
+            "product_url": product_url,
+            "image_url": p.image_url,
+            "observed_at": p.scraped_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        if p.detail:
+            rec["raw_row"] = p.detail
+        return clean_record(rec)
+
+    def _export_jsonl(self, products: list[ScrapedProduct]) -> None:
+        """Stage 1 of the contract: write one JSONL file for this branch+run."""
+        records = [r for r in (self._build_observation(p) for p in products) if r]
+        write_jsonl("woolworths", self.branch_name, records)
 
     # ---- Run loop --------------------------------------------------------
 
@@ -952,11 +1224,22 @@ class WoolworthsClaudeScraper:
             logger.info(f"TOTAL scraped: {len(all_products)} products")
             self._update_run(run_id, total_scraped=len(all_products))
 
-            if not self.dry_run:
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self._save_to_supabase, all_products, stats)
-            else:
-                logger.info("DRY RUN — skipping Supabase writes")
+            # Enrich with the static product card (origins/nutrition/breadcrumb)
+            if all_products:
+                await self.enrich_details(all_products)
+                self._detail_cache.save()
+
+            # --- DATABASE WRITES DISABLED (two-stage contract) ---
+            # The scraper no longer writes to Supabase. It emits one JSONL file per
+            # branch+run; pico-prod/import_products.py owns all DB writes. The old
+            # direct write is kept (commented) for reference, do not re-enable.
+            # if not self.dry_run:
+            #     loop = asyncio.get_event_loop()
+            #     await loop.run_in_executor(None, self._save_to_supabase, all_products, stats)
+            # else:
+            #     logger.info("DRY RUN — skipping Supabase writes")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._export_jsonl, all_products)
 
             status = (
                 "failed" if (stats["records_failed"] and not stats["records_updated"])
@@ -1001,23 +1284,24 @@ class WoolworthsClaudeScraper:
     # ---- Supabase writes -------------------------------------------------
 
     def _start_run(self) -> Optional[str]:
-        if self.dry_run:
-            return None
-        try:
-            r = (
-                self.supabase.table("scraper_runs")
-                .insert({
-                    "chain_id": self.chain_id,
-                    "branch_id": self.branch_id,
-                    "status": "running",
-                    "started_at": datetime.now(timezone.utc).isoformat(),
-                })
-                .execute()
-            )
-            return r.data[0]["id"]
-        except Exception as e:
-            logger.warning(f"could not start scraper_runs row: {e}")
-            return None
+        # DATABASE WRITE DISABLED — run tracking moves to ingest.import_runs on the
+        # import side. Returning None makes _update_run/_end_run no-op safely.
+        return None
+        # try:
+        #     r = (
+        #         self.supabase.table("scraper_runs")
+        #         .insert({
+        #             "chain_id": self.chain_id,
+        #             "branch_id": self.branch_id,
+        #             "status": "running",
+        #             "started_at": datetime.now(timezone.utc).isoformat(),
+        #         })
+        #         .execute()
+        #     )
+        #     return r.data[0]["id"]
+        # except Exception as e:
+        #     logger.warning(f"could not start scraper_runs row: {e}")
+        #     return None
 
     def _update_run(self, run_id: Optional[str], **fields) -> None:
         if not run_id:
