@@ -415,6 +415,14 @@ def extract_fs_detail(data: dict) -> dict:
         v = d.get(src)
         if v not in (None, "", [], {}):
             out.setdefault(key, v)
+
+    # Free-text blurb the site renders as data-testid="product-description". Already in
+    # this response, so no extra request. For the ~25% of products Foodstuffs ships with
+    # no structured card, it is the only detail there is (and sometimes carries the
+    # "May contain ..." line). Stored verbatim — never parsed into allergen fields.
+    desc = d.get("description")
+    if desc:
+        out["description"] = desc
     return out
 
 
@@ -871,11 +879,20 @@ class BarcodeCache:
 
     def needs_detail(self, product_id: str) -> bool:
         """True until we've fetched the static card (barcode + rich detail) once.
-        Specials come from the listing, so detail is fetched cache-miss-only."""
+        Specials come from the listing, so detail is fetched cache-miss-only.
+
+        'rich_checked' marks a card parsed by the current extractor. Entries cached
+        before it existed are re-fetched exactly once, so they pick up 'description'
+        whether their card was empty or already populated. After that a product is
+        settled — including the genuinely bare ones Foodstuffs ships with no
+        nutrition/origin/description at all, which must not re-fetch forever."""
         v = self._data.get(product_id)
         if not isinstance(v, dict):
             return True
-        return not v.get("bc") or not v.get("det")
+        det = v.get("det") or {}
+        if not v.get("bc") or not det:
+            return True
+        return not det.get("rich_checked")
 
     def needs_fetch(self, product_id: str) -> bool:
         """True if we haven't done a detail fetch yet (absent, or legacy
@@ -908,8 +925,13 @@ class BarcodeCache:
         self._data[product_id] = entry
 
     def save(self) -> None:
+        # Atomic write: dump to a temp file in the same dir, then os.replace() —
+        # a crash mid-write can never corrupt or truncate the real cache file, so
+        # the long one-time re-enrichment is safe to interrupt and resume.
         try:
-            self.path.write_text(json.dumps(self._data, ensure_ascii=False))
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self._data, ensure_ascii=False))
+            os.replace(tmp, self.path)
             logger.info(f"barcode cache: saved {len(self._data)} entries")
         except Exception as e:
             logger.warning(f"cache save failed: {e}")
@@ -1757,8 +1779,13 @@ class FoodstuffsScraper:
         unit_price = (float(upu) / 100) if isinstance(upu, (int, float)) else None
         unit_label = data.get("comparativeUnitMeasureDescription") or None
         category_path = category_path_from_trees(data.get("categoryTrees"))
+        rich = extract_fs_detail(data)
         static_cache = {
-            "rich": extract_fs_detail(data),
+            "rich": rich,
+            # We parsed a real 200 response. Some products are shipped bare by
+            # Foodstuffs (no nutrition/origin/description at all) — record that we
+            # looked, so an empty 'rich' isn't mistaken for "never fetched".
+            "rich_checked": True,
             "unit_price": unit_price,
             "unit_label": unit_label,
             "category_path": category_path,

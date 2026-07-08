@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import json
 import logging
 import math
 import os
@@ -81,7 +82,8 @@ BASE_URL = "https://www.woolworths.co.nz"
 # health-star/breadcrumb) which the listing does not carry.
 WW_DETAIL_API = BASE_URL + "/api/v1/products/{sku}"
 WW_DETAIL_CACHE_PATH = Path(__file__).resolve().parent / ".woolworths_detail_cache.json"
-WW_DETAIL_CONCURRENCY = 5  # low — WW is Akamai-protected and session-pinned
+WW_DETAIL_CONCURRENCY = 50  # warm-only; pushed hard for speed. WW tolerated 5 with ~0 fails. If fails climb, dial back.
+WW_DETAIL_SAVE_EVERY = 500  # flush the warm cache to disk every N SKUs (crash-safe/resumable)
 
 # Categories cover the full /shop/browse top-level taxonomy (verified 2026-05).
 CATEGORY_URLS: list[str] = [
@@ -287,10 +289,16 @@ class WWDetailCache:
     def put(self, sku: str, det: dict) -> None:
         self._data[sku] = det
 
-    def save(self) -> None:
+    def save(self, *, quiet: bool = False) -> None:
+        # Atomic write: dump to a temp file in the same dir, then os.replace() —
+        # a crash mid-write can never corrupt or truncate the real cache file, so
+        # the long one-time warm is safe to interrupt and resume.
         try:
-            self.path.write_text(json.dumps(self._data, ensure_ascii=False))
-            logger.info(f"ww detail cache: saved {len(self._data)} entries")
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self._data, ensure_ascii=False))
+            os.replace(tmp, self.path)
+            if not quiet:
+                logger.info(f"ww detail cache: saved {len(self._data)} entries")
         except Exception as e:
             logger.warning(f"ww detail cache save failed: {e}")
 
@@ -1046,12 +1054,15 @@ class WoolworthsClaudeScraper:
             f"({cached}/{len(skus)} SKUs cached)"
         )
 
-    async def warm_detail_cache(self, products: list[ScrapedProduct]) -> None:
+    async def warm_detail_cache(self, products: list[ScrapedProduct], *, block: bool = False) -> None:
         """Live-fetch the static detail card for cache-miss SKUs into the shared
-        on-disk cache. Runs AFTER the JSONL export, and only ONE branch fetches at
-        a time (global lock) so concurrent branches never stampede WW's Akamai
-        detail endpoint. Detail is product-global, so this warms the cache for the
-        remaining branches rather than re-fetching per store. Best-effort."""
+        on-disk cache. Only ONE branch fetches at a time (global lock) so concurrent
+        branches never stampede WW's Akamai detail endpoint. Detail is product-global,
+        so this warms the cache for all branches rather than re-fetching per store.
+
+        block=False (best-effort): if another branch already holds the lock, skip.
+        block=True: wait for the lock and warm before returning — used pre-export so
+        THIS branch's JSONL carries the full breadcrumb category + origin/nutrition."""
         skus = {p.sku for p in products if p.sku}
         to_fetch = [s for s in skus if not self._detail_cache.has(s)]
         if not to_fetch or not self._page:
@@ -1062,11 +1073,10 @@ class WoolworthsClaudeScraper:
         }
         fetched = failed = 0
         lock = get_ww_detail_lock()
-        if lock.locked():
+        if lock.locked() and not block:
             # Another branch is already warming the shared, product-global cache.
-            # Don't queue behind it — this branch has already written its JSONL, so
-            # just return and free its worker slot. These SKUs fill from the shared
-            # cache once the warm finishes (and fully on the next run).
+            # Best-effort mode: don't queue behind it — return and free this worker
+            # slot. These SKUs fill from the shared cache once the warm finishes.
             logger.info(
                 f"  [detail] shared cache already warming elsewhere — skipping "
                 f"({len(to_fetch)} SKUs)"
@@ -1079,34 +1089,45 @@ class WoolworthsClaudeScraper:
                 return
             logger.info(f"  [detail] warming shared cache: {len(to_fetch)} SKUs need API fetch")
             i = 0
-            while i < len(to_fetch):
-                batch = to_fetch[i : i + WW_DETAIL_CONCURRENCY]
-                i += len(batch)
+            saved_at = 0  # SKUs fetched since the last incremental flush to disk
+            try:
+                while i < len(to_fetch):
+                    batch = to_fetch[i : i + WW_DETAIL_CONCURRENCY]
+                    i += len(batch)
 
-                async def fetch_one(sku: str) -> tuple[str, Optional[dict]]:
-                    try:
-                        assert self._page
-                        resp = await self._page.request.get(
-                            WW_DETAIL_API.format(sku=sku), headers=headers)
-                        if resp.ok:
-                            return sku, parse_ww_detail(await resp.json())
-                        return sku, None
-                    except Exception:
-                        return sku, None
+                    async def fetch_one(sku: str) -> tuple[str, Optional[dict]]:
+                        try:
+                            assert self._page
+                            resp = await self._page.request.get(
+                                WW_DETAIL_API.format(sku=sku), headers=headers,
+                                timeout=15000)  # cap per-request so one hang can't stall the batch
+                            if resp.ok:
+                                return sku, parse_ww_detail(await resp.json())
+                            return sku, None
+                        except Exception:
+                            return sku, None
 
-                for sku, det in await asyncio.gather(*[fetch_one(s) for s in batch]):
-                    if det is not None:
-                        self._detail_cache.put(sku, det)
-                        fetched += 1
-                    else:
-                        failed += 1
-                if i % 1000 == 0:
-                    logger.info(
-                        f"  [detail] warming… {min(i, len(to_fetch))}/{len(to_fetch)} "
-                        f"({fetched} ok, {failed} fail)"
-                    )
-                await asyncio.sleep(random.uniform(0.3, 0.8))
-            self._detail_cache.save()
+                    for sku, det in await asyncio.gather(*[fetch_one(s) for s in batch]):
+                        if det is not None:
+                            self._detail_cache.put(sku, det)
+                            fetched += 1
+                        else:
+                            failed += 1
+                    # Incrementally persist every ~500 SKUs so an interruption of this
+                    # long one-time warm never throws away hours of fetched detail;
+                    # the next run resumes from the on-disk cache (atomic write).
+                    if fetched - saved_at >= WW_DETAIL_SAVE_EVERY:
+                        self._detail_cache.save(quiet=True)
+                        saved_at = fetched
+                    if i % 1000 == 0:
+                        logger.info(
+                            f"  [detail] warming… {min(i, len(to_fetch))}/{len(to_fetch)} "
+                            f"({fetched} ok, {failed} fail)"
+                        )
+                    await asyncio.sleep(random.uniform(0.1, 0.3))
+            finally:
+                # Always flush whatever we fetched — even on Ctrl-C / crash / cancel.
+                self._detail_cache.save()
         logger.info(f"  [detail] warm done: fetched {fetched}, failed {failed}")
 
     # ---- JSONL export (Scraper Data Contract — replaces DB writes) --------
@@ -1274,10 +1295,15 @@ class WoolworthsClaudeScraper:
             logger.info(f"TOTAL scraped: {len(all_products)} products")
             self._update_run(run_id, total_scraped=len(all_products))
 
-            # Attach any detail cards we ALREADY have cached (instant, read-only).
-            # We do NOT live-fetch here — the JSONL must be written the moment this
-            # branch's catalog is scraped, never blocked behind ~17k detail requests.
+            # Warm the shared product-global detail cache BEFORE the export so this
+            # branch's JSONL carries the full breadcrumb category (Dept > Aisle >
+            # Shelf) and the rich card (origin/nutrition/allergens/health-star).
+            # Serialized across branches by a global lock; detail is cached product-
+            # globally, so the first branch pays the fetch and later branches mostly
+            # hit the warm cache. This intentionally blocks the export until detail
+            # is fetched — completeness over speed.
             if all_products:
+                await self.warm_detail_cache(all_products, block=True)
                 self.attach_cached_details(all_products)
 
             # --- DATABASE WRITES DISABLED (two-stage contract) ---
@@ -1291,14 +1317,6 @@ class WoolworthsClaudeScraper:
             #     logger.info("DRY RUN — skipping Supabase writes")
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._export_jsonl, all_products)
-
-            # Best-effort: warm the shared, product-global detail cache for the
-            # OTHER branches. Runs AFTER the export and is serialized across
-            # branches by a global lock, so it never delays this branch's JSONL
-            # and never stampedes WW's detail endpoint. Later branches read it for
-            # free; a re-run backfills detail for the first branch.
-            if all_products:
-                await self.warm_detail_cache(all_products)
 
             status = (
                 "failed" if (stats["records_failed"] and not stats["records_updated"])
