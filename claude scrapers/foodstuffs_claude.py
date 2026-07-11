@@ -293,6 +293,13 @@ ENRICH_CONCURRENCY_MIN = 1
 ENRICH_429_THRESHOLD = 3   # consecutive 429s before downscale
 BARCODE_API = "https://api-prod.newworld.co.nz/v1/edge/store/{store_id}/product/{pid}"
 
+# Algolia hard-caps paginated results at 20 pages * 50/page = 1000 hits (this is the
+# retailer's own website limit too, not something we impose). When a category query
+# lands on exactly this ceiling, category1SI/brand facet counts >1000 combined
+# mean real products are hidden beyond hit 1000 — split the query by facet value to
+# recover them. See _recover_capped_category / _fetch_filtered_category.
+ALGOLIA_PAGE_CAP = 20
+
 # Asset-blocking patterns to cut bandwidth (~3x reduction)
 ASSET_BLOCK_RE = re.compile(
     r"\.(png|jpg|jpeg|gif|webp|svg|ico|woff2?|ttf|otf|mp4|mp3|css)(\?|$)|"
@@ -1537,6 +1544,7 @@ class FoodstuffsScraper:
             await asyncio.sleep(0.4)
 
         products: list[ScrapedProduct] = []
+        seen_ids: set[str] = set()
         for data in all_responses:
             items = (
                 data.get("products") or data.get("items")
@@ -1546,13 +1554,142 @@ class FoodstuffsScraper:
                 p = self._parse_item(item, category)
                 if p:
                     products.append(p)
+                    if p.product_id:
+                        seen_ids.add(p.product_id)
 
         if not products:
             logger.warning(f"  [direct] {url} → 0 products — browser fallback")
             return None
 
+        recovered_label = ""
+        if total_pages >= ALGOLIA_PAGE_CAP:
+            recovered = await self._recover_capped_category(url, body, rj, category, seen_ids)
+            if recovered:
+                products.extend(recovered)
+                recovered_label = f" (+{len(recovered)} beyond 1000-hit cap)"
+
         pages_label = f"{total_pages}p" if total_pages > 1 else ""
-        logger.info(f"  [direct] {url}  {len(products)} products {pages_label}".rstrip())
+        logger.info(f"  [direct] {url}  {len(products)} products {pages_label}{recovered_label}".rstrip())
+        return products
+
+    async def _recover_capped_category(
+        self, url: str, base_body: dict, page0_response: dict, category: str, seen_ids: set[str],
+    ) -> list[ScrapedProduct]:
+        """A category query that lands on exactly ALGOLIA_PAGE_CAP pages means Algolia
+        stopped paginating at its 1000-hit ceiling — the same limit the live website
+        hits. If the category0SI facet counts sum to more than 1000, the remainder is
+        invisible to plain pagination but reachable by adding a category1SI filter
+        (Algolia scopes each facet count independently of the pagination cap)."""
+        facets = (page0_response.get("facets") or {}).get("category1SI") or {}
+        asr_facets = ((page0_response.get("algoliaSearchResult") or {}).get("facets") or {}).get("category1SI") or {}
+        if not facets and asr_facets:
+            facets = asr_facets
+        if not facets:
+            import json as _json
+            dbg_path = Path("/tmp/claude-1000/-home-boiledpotato-Downloads-scrapers/fba76523-0f9e-44bf-ba9f-4edf5db328bd/scratchpad/page0_debug.json")
+            asr = page0_response.get("algoliaSearchResult") or {}
+            summary = {
+                "totalHits": page0_response.get("totalHits"),
+                "totalPages": page0_response.get("totalPages"),
+                "hitsPerPage": page0_response.get("hitsPerPage"),
+                "top_keys": list(page0_response.keys()),
+                "algoliaSearchResult_keys": list(asr.keys()) if isinstance(asr, dict) else str(type(asr)),
+                "algoliaSearchResult_no_hits": {k: v for k, v in asr.items() if k != "hits"} if isinstance(asr, dict) else None,
+            }
+            dbg_path.write_text(_json.dumps(summary, indent=2, default=str))
+            logger.warning(
+                f"  [direct] {url} → capped at {ALGOLIA_PAGE_CAP * 50} hits, "
+                f"no category1SI facet to split by — some products may be missing "
+                f"(debug dump: {dbg_path}, totalHits={page0_response.get('totalHits')})"
+            )
+            return []
+
+        base_filters = base_body["algoliaQuery"]["filters"]
+        recovered: list[ScrapedProduct] = []
+        for subcat, count in facets.items():
+            if not count:
+                continue
+            sub_products = await self._fetch_filtered_category(
+                url, base_body, base_filters, "category1SI", subcat, category
+            )
+            for p in sub_products:
+                if p.product_id and p.product_id not in seen_ids:
+                    seen_ids.add(p.product_id)
+                    recovered.append(p)
+        if recovered:
+            logger.info(
+                f"  [direct] {url} → recovered {len(recovered)} additional products "
+                f"beyond the 1000-hit cap via category1SI split"
+            )
+        return recovered
+
+    async def _fetch_filtered_category(
+        self, url: str, base_body: dict, base_filters: str,
+        facet_field: str, facet_value: str, category: str, depth: int = 0,
+    ) -> list[ScrapedProduct]:
+        """Re-run the category query with an extra `facet_field:"facet_value"` filter
+        appended, paginating fully. If this narrower slice is STILL capped at 1000
+        (a very large subcategory), recurse one more level by `brand` facet — depth
+        is capped at 1 to bound the fan-out."""
+        body = copy.deepcopy(base_body)
+        body["algoliaQuery"]["filters"] = f'{base_filters} AND {facet_field}:"{facet_value}"'
+        body["page"] = 0
+        try:
+            if self._rate_limiter:
+                await self._rate_limiter.acquire()
+            resp = await self._post_with_425_retry(self._direct_url, self._direct_headers, body)
+            if not resp.ok:
+                return []
+            rj = await resp.json()
+        except Exception as e:
+            logger.warning(f"  [direct] {url} [{facet_field}={facet_value}]: {e} — skipping")
+            return []
+
+        total_pages = rj.get("totalPages") or 1
+        all_responses = [rj]
+        for page_num in range(1, total_pages):
+            pb = copy.deepcopy(body)
+            pb["page"] = page_num
+            try:
+                if self._rate_limiter:
+                    await self._rate_limiter.acquire()
+                r2 = await self._post_with_425_retry(self._direct_url, self._direct_headers, pb)
+                if r2.ok:
+                    all_responses.append(await r2.json())
+                else:
+                    break
+            except Exception:
+                break
+            await asyncio.sleep(0.4)
+
+        products: list[ScrapedProduct] = []
+        seen_here: set[str] = set()
+        for data in all_responses:
+            items = (
+                data.get("products") or data.get("items")
+                or (data.get("pageProps") or {}).get("products") or []
+            )
+            for item in items:
+                p = self._parse_item(item, category)
+                if p:
+                    products.append(p)
+                    if p.product_id:
+                        seen_here.add(p.product_id)
+
+        if total_pages >= ALGOLIA_PAGE_CAP and depth == 0:
+            brand_facets = (rj.get("facets") or {}).get("brand") or {}
+            sub_filters = body["algoliaQuery"]["filters"]
+            for brand, count in brand_facets.items():
+                if not count:
+                    continue
+                brand_products = await self._fetch_filtered_category(
+                    url, base_body, sub_filters, "brand", brand, category, depth=1
+                )
+                for p in brand_products:
+                    if p.product_id and p.product_id not in seen_here:
+                        seen_here.add(p.product_id)
+                        products.append(p)
+
         return products
 
     def _parse_item(self, item: dict, category: str) -> Optional[ScrapedProduct]:
@@ -2687,9 +2824,9 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
         logger.info(f"[proxy] scrape routed through {launch_kwargs['proxy'].get('server')}")
     shared_browser = await playwright_instance.chromium.launch(**launch_kwargs)
 
-    # Global rate limiter: 4 req/sec max across all workers
-    # try this if hitting many blocks: TokenBucketLimiter(rate=6.0, burst=6)
-    rate_limiter = TokenBucketLimiter(rate=4.0, burst=4)
+    # Global rate limiter: max req/sec across all workers
+    # TEST: bumped 4 -> 12 to measure block/429 behavior at higher throughput
+    rate_limiter = TokenBucketLimiter(rate=12.0, burst=12)
 
     overall = {"branches": 0, "updated": 0, "new": 0, "failed": 0, "price_changes": 0,
                "cache_hits": 0, "fetched": 0, "blocks": 0}
