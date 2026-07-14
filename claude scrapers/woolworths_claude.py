@@ -224,6 +224,12 @@ class ScrapedProduct:
     promo_type: Optional[str] = None
     card_required: bool = False
     loyalty_program_code: Optional[str] = None # everyday-rewards
+    source_promotion_id: Optional[str] = None  # retailer promo id (WW: usually none)
+    promo_starts_at: Optional[str] = None      # ISO from price.promotionStartDate
+    promo_ends_at: Optional[str] = None        # ISO from price.promotionEndDate
+    multibuy_quantity: Optional[int] = None
+    multibuy_price_cents: Optional[int] = None
+    promo_metadata: dict = field(default_factory=dict)  # productTags badges / raw multiBuy
     detail: dict = field(default_factory=dict) # rich raw_row (country, nutrition, ...)
 
 
@@ -967,6 +973,32 @@ class WoolworthsClaudeScraper:
         promo_type = promo_text = loyalty_code = None
         card_required = False
         comparison = None
+        source_promotion_id = None  # Woolworths does not expose a stable promo id
+        promo_starts_at = price_data.get("promotionStartDate") or None
+        promo_ends_at = price_data.get("promotionEndDate") or None
+        multibuy_quantity = multibuy_price_cents = None
+        promo_metadata: dict = {}
+
+        # Retailer badges drive classification — never infer half-price from the
+        # 50%-off maths (a deep clearance is not a half-price promo).
+        tags = item.get("productTags") or []
+        tag_types = [str(t.get("tagType")).strip() for t in tags
+                     if isinstance(t, dict) and t.get("tagType")]
+        if tag_types:
+            promo_metadata["badges"] = tag_types
+        tag_blob = " ".join(tag_types).lower()
+        multibuy_raw = next((t.get("multiBuy") for t in tags
+                             if isinstance(t, dict) and t.get("multiBuy")), None)
+        if isinstance(multibuy_raw, dict):
+            promo_metadata["multiBuy"] = multibuy_raw
+            q = multibuy_raw.get("quantity") or multibuy_raw.get("multiBuyForQuantity")
+            amt = multibuy_raw.get("price") or multibuy_raw.get("value") or multibuy_raw.get("amount")
+            try:
+                multibuy_quantity = int(q) if q else None
+            except (TypeError, ValueError):
+                multibuy_quantity = None
+            multibuy_price_cents = to_cents(float(amt)) if amt not in (None, "") else None
+
         if special is not None:
             comparison = price_f  # original / was price
             is_club = bool(price_data.get("isClubPrice"))
@@ -974,13 +1006,25 @@ class WoolworthsClaudeScraper:
                 promo_type = "member_price"
                 card_required = True
                 loyalty_code = "everyday-rewards"
-            elif special <= price_f / 2 + 0.001:
+            elif "clearance" in tag_blob:
+                promo_type = "clearance"
+            elif "half" in tag_blob:               # only when the retailer says so
                 promo_type = "half_price"
+            elif multibuy_quantity:
+                promo_type = "multibuy_fixed_price"
             else:
                 promo_type = "special"
             save = price_data.get("savePrice")
             if save:
                 promo_text = f"Save ${float(save):.2f}"
+        elif multibuy_quantity:
+            promo_type = "multibuy_fixed_price"
+
+        if promo_type is None:
+            # No active promotion — don't attach stray promo dates/badges.
+            promo_starts_at = promo_ends_at = None
+            multibuy_quantity = multibuy_price_cents = None
+            promo_metadata = {}
 
         size = item.get("size") or {}
         weight = size.get("volumeSize") or None
@@ -1027,6 +1071,12 @@ class WoolworthsClaudeScraper:
             promo_text=promo_text,
             card_required=card_required,
             loyalty_program_code=loyalty_code,
+            source_promotion_id=source_promotion_id,
+            promo_starts_at=promo_starts_at,
+            promo_ends_at=promo_ends_at,
+            multibuy_quantity=multibuy_quantity,
+            multibuy_price_cents=multibuy_price_cents,
+            promo_metadata=promo_metadata,
         )
 
     # ---- Detail enrichment (static rich card, cache-backed) --------------
@@ -1159,6 +1209,12 @@ class WoolworthsClaudeScraper:
             "promo_type": p.promo_type,
             "card_required": p.card_required or None,
             "required_loyalty_program_code": p.loyalty_program_code,
+            "source_promotion_id": p.source_promotion_id,
+            "promo_starts_at": p.promo_starts_at,
+            "promo_ends_at": p.promo_ends_at,
+            "multibuy_quantity": p.multibuy_quantity,
+            "multibuy_price_cents": p.multibuy_price_cents,
+            "promo_metadata": p.promo_metadata or None,
             "product_url": product_url,
             "image_url": p.image_url,
             "observed_at": p.scraped_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

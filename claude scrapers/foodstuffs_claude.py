@@ -353,6 +353,10 @@ class ScrapedProduct:
     promo_type: Optional[str] = None           # contract promo_type code
     card_required: bool = False                # loyalty/member card needed?
     loyalty_program_code: Optional[str] = None # club-plus / everyday-rewards
+    source_promotion_id: Optional[str] = None  # retailer promoId (stable deal id)
+    multibuy_quantity: Optional[int] = None    # threshold when >1 (e.g. 3 for $6)
+    multibuy_price_cents: Optional[int] = None # total price for multibuy_quantity units
+    promo_metadata: dict = field(default_factory=dict)  # badges: decal/sapType/rewardType/limit/description
     detail: dict = field(default_factory=dict) # rich raw_row (country, nutrition, ...)
 
 
@@ -1612,6 +1616,11 @@ class FoodstuffsScraper:
             sub_products = await self._fetch_filtered_category(
                 url, base_body, base_filters, "category1SI", subcat, category
             )
+            if len(sub_products) < count:
+                # category1SI is multi-valued (a product can sit in >1 bucket), so this
+                # is NOT double-counted against `count` — a real shortfall here means a
+                # page in this bucket failed mid-pagination (see the warnings below).
+                logger.warning(f"  [direct] {url} bucket '{subcat}': got {len(sub_products)}/{count} — possible shortfall of {count - len(sub_products)}")
             for p in sub_products:
                 if p.product_id and p.product_id not in seen_ids:
                     seen_ids.add(p.product_id)
@@ -1657,8 +1666,10 @@ class FoodstuffsScraper:
                 if r2.ok:
                     all_responses.append(await r2.json())
                 else:
+                    logger.warning(f"  [direct] {facet_field}={facet_value} page {page_num}/{total_pages}: HTTP {r2.status} — truncating bucket here")
                     break
-            except Exception:
+            except Exception as e:
+                logger.warning(f"  [direct] {facet_field}={facet_value} page {page_num}/{total_pages}: {e} — truncating bucket here")
                 break
             await asyncio.sleep(0.4)
 
@@ -1717,6 +1728,8 @@ class FoodstuffsScraper:
         # promotion's rewardValue (cents) is the deal price.
         special = comparison = promo_type = promo_text = loyalty_code = None
         card_required = False
+        source_promotion_id = multibuy_quantity = multibuy_price_cents = None
+        promo_metadata: dict = {}
         promos = item.get("promotions") or []
         if promos:
             promo = next((p for p in promos if p.get("bestPromotion")), promos[0])
@@ -1724,14 +1737,25 @@ class FoodstuffsScraper:
             reward_value = promo.get("rewardValue")
             threshold = promo.get("threshold") or 1
             card_required = bool(promo.get("cardDependencyFlag"))
+            if promo.get("promoId") is not None:
+                source_promotion_id = str(promo.get("promoId"))
+            # Badge / campaign metadata — kept for classification + audit, not price maths.
+            for k in ("decal", "sapType", "rewardType", "limit", "description"):
+                v = promo.get(k)
+                if v is not None and v != "":
+                    promo_metadata[k] = v
             try:
                 rv = float(reward_value) / 100 if reward_value else None
             except (TypeError, ValueError):
                 rv = None
             if threshold > 1 and rv:
-                # multibuy: rewardValue is the total price for `threshold` units
+                # multibuy: rewardValue is the total price for `threshold` units.
+                # Current price stays the regular single-buy price; the deal is
+                # carried as structured multibuy fields.
                 promo_type = "multibuy_fixed_price"
                 promo_text = f"{threshold} for ${rv:.2f}"
+                multibuy_quantity = int(threshold)
+                multibuy_price_cents = int(round(rv * 100))
             elif reward_type == "NEW_PRICE" and rv is not None and rv < price:
                 special = rv
                 comparison = price                 # singlePrice.price = regular
@@ -1744,6 +1768,10 @@ class FoodstuffsScraper:
                 promo_text = f"Special ${rv:.2f}"
             if card_required and promo_type:
                 loyalty_code = "club-plus"
+        if promo_type is None:
+            # No classified promotion — don't attach stray promo id/badges/multibuy.
+            source_promotion_id = multibuy_quantity = multibuy_price_cents = None
+            promo_metadata = {}
 
         # Unit price + label (free from the listing's comparativePrice)
         comp = sp.get("comparativePrice") or {}
@@ -1791,6 +1819,10 @@ class FoodstuffsScraper:
             promo_text=promo_text,
             card_required=card_required,
             loyalty_program_code=loyalty_code,
+            source_promotion_id=source_promotion_id,
+            multibuy_quantity=multibuy_quantity,
+            multibuy_price_cents=multibuy_price_cents,
+            promo_metadata=promo_metadata,
         )
 
     # ---- Parallel barcode enrichment with adaptive concurrency ----------
@@ -1991,6 +2023,10 @@ class FoodstuffsScraper:
             "promo_type": p.promo_type,
             "card_required": p.card_required or None,
             "required_loyalty_program_code": p.loyalty_program_code,
+            "source_promotion_id": p.source_promotion_id,
+            "multibuy_quantity": p.multibuy_quantity,
+            "multibuy_price_cents": p.multibuy_price_cents,
+            "promo_metadata": p.promo_metadata or None,
             "product_url": product_url,
             "image_url": p.image_url,
             "observed_at": p.scraped_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
