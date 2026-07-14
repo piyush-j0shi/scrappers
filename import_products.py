@@ -437,7 +437,7 @@ def dedupe(records: list[dict]) -> tuple[list[dict], int]:
         k = key(r)
         if k in best:
             dupes += 1
-            log.info("DUPLICATE skipped: id=%s — %s", k, r.get("raw_name") or r.get("name"))
+            log.debug("DUPLICATE skipped: id=%s — %s", k, r.get("raw_name") or r.get("name"))
             if completeness(r) > completeness(best[k]):
                 best[k] = r
         else:
