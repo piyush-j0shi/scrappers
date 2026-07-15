@@ -741,7 +741,8 @@ class Importer:
                 ) if rec["card_required"] else None
                 rec["_normalized_promo"] = rec["promo_type"] if rec["promo_type"] in ALLOWED_PROMO_TYPES else None
 
-            self._bulk_insert_observations(batch, Jsonb)
+            # DISABLED 2026-07-14 (per request): skip scraped_observations write.
+            # self._bulk_insert_observations(batch, Jsonb)
 
             rp_ids, canonical_ids, variant_ids, is_new = self._bulk_upsert_retailer_products(batch, Jsonb)
 
@@ -783,29 +784,33 @@ class Importer:
             self._seen_retailer_product_ids.add(rp_id)
 
     # ---- stage: scraped_observations (always insert) ----------------------- #
+    # DISABLED 2026-07-14 (per request): scraped_observations preprocessing +
+    # DB write are commented out. Restore by removing the `return` below and
+    # uncommenting the body, plus the call site in process_batch (~line 745).
     def _bulk_insert_observations(self, batch: list[dict], Jsonb) -> None:
-        cols = ("import_run_id", "retailer_id", "branch_id", "source_product_id",
-                "retailer_sku", "barcode", "raw_name", "raw_brand", "raw_category_path",
-                "product_url", "image_url", "price_cents", "comparison_price_cents",
-                "unit_price_cents", "unit_label", "stock_status", "stock_quantity",
-                "raw_promo_text", "normalized_promo_type", "observed_at", "raw_row",
-                "card_required", "required_loyalty_program_id")
-        types = ("uuid", "uuid", "uuid", "text", "text", "text", "text", "text", "text",
-                 "text", "text", "integer", "integer", "integer", "text", "catalog.stock_status",
-                 "integer", "text", "catalog.promo_type", "timestamptz", "jsonb", "boolean", "uuid")
-        rows = [(
-            self.run_id, self.retailer_id, self.branch_id, rec["source_product_id"],
-            rec["retailer_sku"], rec["barcode"], rec["raw_name"], rec["brand"],
-            rec["category_path"], rec["product_url"], rec["image_url"],
-            rec["current_price_cents"], rec["comparison_price_cents"],
-            rec["unit_price_cents"], rec["unit_label"], rec["stock_status"],
-            rec["stock_quantity"], rec["promo_text"], rec["_normalized_promo"],
-            rec["observed_at"], Jsonb(rec["raw_row"]), rec["card_required"], rec["_loyalty_id"],
-        ) for rec in batch]
-        # COPY fast path: this table is append-only (no ON CONFLICT / RETURNING),
-        # so it's the safest and biggest single win. `types` above is kept as an
-        # inline reference to the column types (COPY infers them from the table).
-        self._copy_insert("ingest.scraped_observations", cols, rows)
+        return  # no-op while scraped_observations is disabled
+        # cols = ("import_run_id", "retailer_id", "branch_id", "source_product_id",
+        #         "retailer_sku", "barcode", "raw_name", "raw_brand", "raw_category_path",
+        #         "product_url", "image_url", "price_cents", "comparison_price_cents",
+        #         "unit_price_cents", "unit_label", "stock_status", "stock_quantity",
+        #         "raw_promo_text", "normalized_promo_type", "observed_at", "raw_row",
+        #         "card_required", "required_loyalty_program_id")
+        # types = ("uuid", "uuid", "uuid", "text", "text", "text", "text", "text", "text",
+        #          "text", "text", "integer", "integer", "integer", "text", "catalog.stock_status",
+        #          "integer", "text", "catalog.promo_type", "timestamptz", "jsonb", "boolean", "uuid")
+        # rows = [(
+        #     self.run_id, self.retailer_id, self.branch_id, rec["source_product_id"],
+        #     rec["retailer_sku"], rec["barcode"], rec["raw_name"], rec["brand"],
+        #     rec["category_path"], rec["product_url"], rec["image_url"],
+        #     rec["current_price_cents"], rec["comparison_price_cents"],
+        #     rec["unit_price_cents"], rec["unit_label"], rec["stock_status"],
+        #     rec["stock_quantity"], rec["promo_text"], rec["_normalized_promo"],
+        #     rec["observed_at"], Jsonb(rec["raw_row"]), rec["card_required"], rec["_loyalty_id"],
+        # ) for rec in batch]
+        # # COPY fast path: this table is append-only (no ON CONFLICT / RETURNING),
+        # # so it's the safest and biggest single win. `types` above is kept as an
+        # # inline reference to the column types (COPY infers them from the table).
+        # self._copy_insert("ingest.scraped_observations", cols, rows)
 
     # ---- stage: retailer_products (bulk resolve existing + bulk write) ----- #
     def _bulk_upsert_retailer_products(self, batch: list[dict], Jsonb):
@@ -1620,12 +1625,18 @@ def run_db(args, records: list[dict], rollback: bool) -> int:
         done = 0
         label = "rolled back" if rollback else "committed"
         # Transient errors under concurrency (connection stays alive, tx aborted):
-        # deadlock on shared rows, lock_timeout on the creation lock, or a
-        # statement_timeout cancel. process_batch aborts+resets atomically, so the
-        # batch is always safe to re-run from a clean slate.
+        # deadlock on shared rows, lock_timeout on the creation lock, a
+        # statement_timeout cancel, or a unique-violation race — two parallel
+        # workers (different branches) both SELECT-miss the same brand-new shared
+        # row (a retailer_product keyed by (retailer_id, source_product_id), or a
+        # canonical/variant/barcode) and both INSERT; the loser gets 23505. On
+        # retry its SELECT finds the winner's now-committed row and takes the
+        # UPDATE path, so there's no INSERT to collide. process_batch aborts+resets
+        # atomically, so the batch is always safe to re-run from a clean slate.
         TRANSIENT = (psycopg.errors.DeadlockDetected,
                      psycopg.errors.LockNotAvailable,
-                     psycopg.errors.QueryCanceled)
+                     psycopg.errors.QueryCanceled,
+                     psycopg.errors.UniqueViolation)
         for batch in chunked(deduped, batch_size):
             before = (imp.inserted, imp.updated, imp.new_products, imp.matched)
             for attempt in range(1, MAX_BATCH_RETRIES + 1):
