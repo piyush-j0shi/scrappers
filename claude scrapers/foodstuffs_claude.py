@@ -229,6 +229,20 @@ REQUEST_TIMEOUT_MS = 30_000
 DELAY_MIN = 1.0
 DELAY_MAX = 3.0
 ENRICH_CONCURRENCY_INITIAL = 12
+# Global request ceiling (req/sec) shared by every worker, overridable with
+# --rate. Raised 12 -> 18 on 2026-07-16: the 2026-07-13/14 full runs both
+# finished with blocks=0 at 12, so there was headroom. 18 is a step up, not a
+# proven ceiling — watch blocks=/429s in the DONE line and back off if they climb.
+DEFAULT_RATE_LIMIT = 18.0
+
+# promoId -> {"start","end","suspended"}, harvested from detail promotionList[].
+# Process-wide (like BarcodeCache) because a FoodstuffsScraper is built PER
+# BRANCH: scoped to the instance, all 148 branches would re-fetch the same
+# national deal. Promotions are promotionClass=MASS, so one lookup serves every
+# branch. In-memory only and never persisted — promo weeks roll over, and a
+# stale date is worse than no date. Each chain runs as its own process, so NW
+# and PnS promoIds can't collide here.
+_PROMO_DATE_CACHE: dict[str, dict] = {}
 
 # Cloudflare page-title fragments that indicate a challenge/block
 _CF_BLOCK_TITLES = ("access denied", "just a moment", "security check",
@@ -356,7 +370,9 @@ class ScrapedProduct:
     source_promotion_id: Optional[str] = None  # retailer promoId (stable deal id)
     multibuy_quantity: Optional[int] = None    # threshold when >1 (e.g. 3 for $6)
     multibuy_price_cents: Optional[int] = None # total price for multibuy_quantity units
-    promo_metadata: dict = field(default_factory=dict)  # badges: decal/sapType/rewardType/limit/description
+    promo_starts_at: Optional[str] = None      # only if FS exposes it (see _parse_item)
+    promo_ends_at: Optional[str] = None
+    promo_metadata: dict = field(default_factory=dict)  # badges + raw_promotion audit copy
     detail: dict = field(default_factory=dict) # rich raw_row (country, nutrition, ...)
 
 
@@ -981,6 +997,7 @@ class FoodstuffsScraper:
         self.branch_id = branch_id
         self.api_store_id: Optional[str] = None
         self.chain_id: Optional[str] = None
+        self._promo_date_cache = _PROMO_DATE_CACHE  # shared across branch workers
 
         slugs = category_slugs or self.cfg["categories"]
         self.category_urls = [f"{self.cfg['base_url']}/shop/category/{s}" for s in slugs]
@@ -1729,6 +1746,7 @@ class FoodstuffsScraper:
         special = comparison = promo_type = promo_text = loyalty_code = None
         card_required = False
         source_promotion_id = multibuy_quantity = multibuy_price_cents = None
+        promo_starts_at = promo_ends_at = None
         promo_metadata: dict = {}
         promos = item.get("promotions") or []
         if promos:
@@ -1744,6 +1762,13 @@ class FoodstuffsScraper:
                 v = promo.get(k)
                 if v is not None and v != "":
                     promo_metadata[k] = v
+            # Full promo object kept for audit — the fixed whitelist above would
+            # silently drop any field FS adds later.
+            promo_metadata["raw_promotion"] = promo
+            # NOTE: the listing promo object carries NO dates (confirmed against a
+            # live response 2026-07-16). promo_starts_at/promo_ends_at are filled
+            # later from the DETAIL response's promotionList[], looked up by
+            # promoId — see _apply_promo_dates / enrich_barcodes.
             try:
                 rv = float(reward_value) / 100 if reward_value else None
             except (TypeError, ValueError):
@@ -1771,6 +1796,7 @@ class FoodstuffsScraper:
         if promo_type is None:
             # No classified promotion — don't attach stray promo id/badges/multibuy.
             source_promotion_id = multibuy_quantity = multibuy_price_cents = None
+            promo_starts_at = promo_ends_at = None
             promo_metadata = {}
 
         # Unit price + label (free from the listing's comparativePrice)
@@ -1822,6 +1848,8 @@ class FoodstuffsScraper:
             source_promotion_id=source_promotion_id,
             multibuy_quantity=multibuy_quantity,
             multibuy_price_cents=multibuy_price_cents,
+            promo_starts_at=promo_starts_at,
+            promo_ends_at=promo_ends_at,
             promo_metadata=promo_metadata,
         )
 
@@ -1844,9 +1872,31 @@ class FoodstuffsScraper:
         # 'promotions' (parsed in _parse_item), so detail is fetched cache-miss
         # only — fetch once per product, then served from cache.
         to_fetch: list[str] = [pid for pid in unique_pids if self.cache.needs_detail(pid)]
+
+        # Promo dates come ONLY from the detail response, but detail is otherwise
+        # fetched cache-miss only (1.7M cached / 501 fetched on the last run), so
+        # promo products would essentially never re-fetch and dates would stay
+        # null. Force a fetch for promos whose dates we don't have yet — but only
+        # ONE product per promoId, not one per product: a single FS promoId spans
+        # many products (promoId 130294910 covers 13 Bluebird SKUs) and
+        # promotionClass is MASS, i.e. national. That turns ~300k fetches into one
+        # per distinct deal. Already-queued pids are reused rather than refetched.
+        queued = set(to_fetch)
+        want_dates: dict[str, str] = {}  # promoId -> representative product_id
+        for p in products:
+            pid, promo_id = p.product_id, p.source_promotion_id
+            if not pid or not promo_id or promo_id in self._promo_date_cache:
+                continue
+            if pid in queued:
+                want_dates.setdefault(promo_id, pid)   # already fetching it anyway
+            else:
+                want_dates.setdefault(promo_id, pid)
+        extra = [pid for pid in dict.fromkeys(want_dates.values()) if pid not in queued]
+        to_fetch.extend(extra)
         logger.info(
             f"  [detail] {len(unique_pids) - len(to_fetch)}/{len(unique_pids)} cached, "
-            f"{len(to_fetch)} need API fetch (barcode/image/card)"
+            f"{len(to_fetch)} need API fetch (barcode/image/card"
+            f"{f'; +{len(extra)} for {len(want_dates)} promo dates' if extra else ''})"
         )
 
         # Adaptive parallel fetch. detail_map[pid] = parsed fresh detail this run.
@@ -1908,6 +1958,13 @@ class FoodstuffsScraper:
                 f"in {dt:.1f}s (concurrency ended at {current_concurrency})"
             )
 
+        # Harvest promo dates from everything fetched this run (any detail may
+        # carry promotionList, not just the ones fetched for dates) into the
+        # run-level, promoId-keyed cache shared across every branch.
+        for det in detail_map.values():
+            for promo_id, dates in (det.get("promo_dates") or {}).items():
+                self._promo_date_cache.setdefault(promo_id, dates)
+
         # Apply STATIC fields to products: fresh detail this run, else cache
         # fallback. Specials are already set from the listing in _parse_item.
         applied = imaged = 0
@@ -1929,6 +1986,19 @@ class FoodstuffsScraper:
                 if img:
                     p.image_url = img; imaged += 1
                 self._apply_static(p, self.cache.get_detail(p.product_id))
+
+        # Stamp promo dates by promoId. A product only gets dates if it actually
+        # carries that promo, so non-promo products stay clean.
+        dated = 0
+        for p in products:
+            if p.source_promotion_id and not p.promo_starts_at:
+                d = self._promo_date_cache.get(p.source_promotion_id)
+                if d:
+                    p.promo_starts_at, p.promo_ends_at = d.get("start"), d.get("end")
+                    dated += 1
+        if dated or self._promo_date_cache:
+            logger.info(f"  [promo] dated {dated} product(s) from "
+                        f"{len(self._promo_date_cache)} known promo(s)")
         stats["from_cache"] = stats["requested"] - stats["fetched"]
         specialed = sum(1 for p in products if p.special_price)
         carded = sum(1 for p in products if p.card_required)
@@ -1959,6 +2029,24 @@ class FoodstuffsScraper:
             "unit_label": unit_label,
             "category_path": category_path,
         }
+        # Promo dates live ONLY on the detail response, under promotionList[] —
+        # the listing's `promotions` object has no date field at all, which is why
+        # every FS promotion imported with starts_at/ends_at NULL. Keyed by
+        # promoId (the STRING form: Pak'nSave sends promotionId=404901247 as an
+        # int but promoId="0404901247" WITH a leading zero, and the listing gives
+        # us the string form — matching on the int would miss every PnS promo).
+        # Deliberately NOT in static_cache: that cache is keyed per product and
+        # effectively permanent (barcodes/images never change), but promo dates
+        # roll over weekly, so caching them there would serve dead dates forever.
+        promo_dates: dict[str, dict] = {}
+        for promo in (data.get("promotionList") or []):
+            if not isinstance(promo, dict):
+                continue
+            pid = promo.get("promoId")
+            start, end = promo.get("startDate"), promo.get("endDate")
+            if pid and (start or end):
+                promo_dates[str(pid)] = {"start": start, "end": end,
+                                         "suspended": bool(promo.get("suspended"))}
         return {
             "barcode": str(sku) if sku else None,
             "image": extract_fs_image(data),
@@ -1968,6 +2056,7 @@ class FoodstuffsScraper:
             "unit_label": unit_label,
             "category_path": category_path,
             "rich": static_cache["rich"],
+            "promo_dates": promo_dates,
             "static_cache": static_cache,
         }
 
@@ -2026,6 +2115,8 @@ class FoodstuffsScraper:
             "source_promotion_id": p.source_promotion_id,
             "multibuy_quantity": p.multibuy_quantity,
             "multibuy_price_cents": p.multibuy_price_cents,
+            "promo_starts_at": p.promo_starts_at,
+            "promo_ends_at": p.promo_ends_at,
             "promo_metadata": p.promo_metadata or None,
             "product_url": product_url,
             "image_url": p.image_url,
@@ -2758,6 +2849,11 @@ def parse_args(argv: Optional[list[str]] = None, default_chain: Optional[str] = 
                     help="Proxy URL (e.g. http://USER:PASS@host:port). Browser + API calls route through it.")
     ap.add_argument("--concurrency", type=int, default=1,
                     help="Number of branches to scrape in parallel (default 1)")
+    ap.add_argument("--rate", type=float, default=DEFAULT_RATE_LIMIT,
+                    help=f"Global request rate ceiling in req/sec shared across all "
+                         f"workers (default {DEFAULT_RATE_LIMIT}). Both NW and PnS "
+                         f"scraped with blocks=0 at 12, so there is headroom — raise "
+                         f"in steps and watch the DONE line's blocks= counter.")
     ap.add_argument("--no-adaptive-drop", action="store_true", default=False,
                         help="Disable adaptive concurrency drop on 429 blocks (keep concurrency fixed)")
     ap.add_argument("--fast-categories", action="store_true", default=True,
@@ -2860,9 +2956,11 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
         logger.info(f"[proxy] scrape routed through {launch_kwargs['proxy'].get('server')}")
     shared_browser = await playwright_instance.chromium.launch(**launch_kwargs)
 
-    # Global rate limiter: max req/sec across all workers
-    # TEST: bumped 4 -> 12 to measure block/429 behavior at higher throughput
-    rate_limiter = TokenBucketLimiter(rate=12.0, burst=12)
+    # Global rate limiter: max req/sec across all workers. Tunable via --rate;
+    # burst tracks the rate so a raised ceiling isn't throttled by a stale burst.
+    rate_limiter = TokenBucketLimiter(rate=args.rate, burst=max(1, int(round(args.rate))))
+    logger.info(f"[rate] global ceiling {args.rate} req/sec across "
+                f"{args.concurrency} worker(s)")
 
     overall = {"branches": 0, "updated": 0, "new": 0, "failed": 0, "price_changes": 0,
                "cache_hits": 0, "fetched": 0, "blocks": 0}
