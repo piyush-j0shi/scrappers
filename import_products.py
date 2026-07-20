@@ -138,6 +138,18 @@ MAX_BATCH_RETRIES = 10
 # 2-minute statement_timeout fires (which cancels the statement AND drops the
 # connection — the cause of the concurrent-run branch failures).
 CREATE_LOCK_TIMEOUT = "8s"
+# An import_run still 'running' after this long has lost its process (finish_run
+# is best-effort and never runs on SIGKILL/OOM/connection loss). Comfortably
+# longer than the slowest observed single-branch import (~15 min) so a live run
+# is never reaped out from under itself.
+STALE_RUN_AFTER = "2 hours"
+# catalog.product_identifiers.last_seen_at is only bumped once a barcode has gone
+# this long without a touch. Barcodes live in the GLOBAL identifier space
+# (retailer_id IS NULL), so they are shared by every branch of every chain —
+# without this gate a 200-branch sweep would rewrite the same ~15k rows 200 times
+# per run (millions of pointless row versions, WAL, and vacuum debt) to record
+# information that only needs to be accurate to within a scrape cycle.
+IDENTIFIER_TOUCH_AFTER = "12 hours"
 
 # --retailer slug (DB, catalog.retailers.slug) -> export filename prefix
 # ({scraper_name} passed to jsonl_export.write_jsonl — confirmed straight from
@@ -492,9 +504,19 @@ class Importer:
         self.reviews_created = 0
         self.reviews_resolved = 0
         self.matched = 0
+        # Latest observed_at seen this run — stamped onto catalog.branches
+        # .last_scraped_at at finish_run. Tracks the SCRAPE time from the export
+        # records, not import wall-clock, so a late import of an old export
+        # can't claim the branch was scraped just now.
+        self.max_observed_at: Optional[str] = None
         self.canonicals_created = 0
         self.variants_created = 0
         self.identifiers_created = 0
+        self.identifiers_touched = 0
+        # retailer_sku values this run declined to write because another row already
+        # owned them (see sku_for). Non-fatal, but a high count means the export has
+        # a lot of sku reuse and is worth reporting rather than silently swallowing.
+        self.sku_conflicts = 0
         self._seen_retailer_product_ids: set[str] = set()
 
     def _one(self, sql: str, params: tuple = ()):  # first row or None
@@ -510,7 +532,8 @@ class Importer:
     # and never touched inside a batch, so it's intentionally excluded.)
     _BATCH_COUNTERS = ("inserted", "updated", "price_changes", "new_products",
                        "reviews_created", "reviews_resolved", "matched",
-                       "canonicals_created", "variants_created", "identifiers_created")
+                       "canonicals_created", "variants_created", "identifiers_created",
+                       "identifiers_touched", "sku_conflicts")
 
     def _counter_snapshot(self) -> dict:
         return {k: getattr(self, k) for k in self._BATCH_COUNTERS}
@@ -549,12 +572,30 @@ class Importer:
         params = [v for row in rows for v in row]
         return ",".join(placeholders), params
 
+    @staticmethod
+    def _unnest_sql(rows: list[tuple], types: tuple[str, ...]) -> tuple[str, list]:
+        """Build an `unnest(%s::t1[], %s::t2[], ...)` FROM-fragment plus one array
+        param per column (columns transposed out of `rows`). Each column is a
+        SINGLE bind param regardless of row count, so this sidesteps Postgres's
+        65,535 bind-param ceiling that a multi-row `VALUES (...),(...)` hits at
+        ~2.8k rows — batches can be 20k+. The `::type[]` array cast pins the
+        column type (so an all-NULL column is unambiguous, same guarantee the
+        row-0 cast gave `_values_sql`). psycopg adapts Python lists to Postgres
+        arrays element-wise: None->NULL, Jsonb->jsonb, enum-label str->enum, etc.
+        Row order is preserved (unnest yields array-index order) — the same
+        positional RETURNING assumption the `VALUES` path already relied on.
+        Multi-arg `unnest(a,b) AS v(x,y)` is used elsewhere here (see promo /
+        exact-name lookups), so this is an established pattern, not a new trick."""
+        frag = "unnest(" + ",".join(f"%s::{t}[]" for t in types) + ")"
+        params = [list(col) for col in zip(*rows)]
+        return frag, params
+
     def _bulk_insert(self, table: str, cols: tuple, types: tuple, rows: list[tuple],
                       returning: Optional[str] = None):
         if not rows:
             return [] if returning else None
-        values_sql, params = self._values_sql(rows, types)
-        sql = f"INSERT INTO {table} ({','.join(cols)}) VALUES {values_sql}"
+        frag, params = self._unnest_sql(rows, types)
+        sql = f"INSERT INTO {table} ({','.join(cols)}) SELECT * FROM {frag}"
         if returning:
             sql += f" RETURNING {returning}"
         self.cur.execute(sql, params)
@@ -568,7 +609,7 @@ class Importer:
             return 0
         all_cols = (key_col,) + set_cols
         all_types = (key_type,) + set_types
-        values_sql, params = self._values_sql(rows, all_types)
+        frag, params = self._unnest_sql(rows, all_types)
         if coalesce:
             set_clause = ", ".join(f"{c} = COALESCE(v.{c}, t.{c})" for c in set_cols)
         else:
@@ -576,7 +617,7 @@ class Importer:
         if extra_set:
             set_clause = f"{set_clause}, {extra_set}" if set_clause else extra_set
         sql = (f"UPDATE {table} AS t SET {set_clause} "
-               f"FROM (VALUES {values_sql}) AS v({','.join(all_cols)}) "
+               f"FROM {frag} AS v({','.join(all_cols)}) "
                f"WHERE t.{key_col} = v.{key_col}")
         self.cur.execute(sql, params)
         return self.cur.rowcount
@@ -668,11 +709,20 @@ class Importer:
             "SELECT id FROM ingest.source_systems WHERE name = %s", (self.source_system,))
         if row:
             return row[0]
+        # get-or-create is racy under parallel workers: they all miss the SELECT
+        # above, then collide on the (source_kind, name) unique constraint. ON
+        # CONFLICT makes the INSERT a no-op for the losers, who re-SELECT the
+        # winner's row below instead of dying with UniqueViolation.
         row = self._one(
             "INSERT INTO ingest.source_systems (source_kind, name, retailer_id, is_active) "
-            "VALUES ('scraper', %s, %s, true) RETURNING id",
+            "VALUES ('scraper', %s, %s, true) "
+            "ON CONFLICT (source_kind, name) DO NOTHING RETURNING id",
             (self.source_system, self.retailer_id))
-        log.info("registered new source_system %r", self.source_system)
+        if row:
+            log.info("registered new source_system %r", self.source_system)
+            return row[0]
+        row = self._one(
+            "SELECT id FROM ingest.source_systems WHERE name = %s", (self.source_system,))
         return row[0]
 
     def _loyalty_id(self, code: Optional[str]) -> Optional[str]:
@@ -688,7 +738,32 @@ class Importer:
         return pid
 
     # ---- run lifecycle ------------------------------------------------------ #
+    def reap_stale_runs(self, older_than: str = STALE_RUN_AFTER):
+        """Close out this branch's abandoned 'running' rows before starting a new
+        one. finish_run() is best-effort: a SIGKILL (pkill -9), an OOM, or a
+        dropped connection leaves status='running' forever, so runs accumulate as
+        permanent false positives (45 of them by 2026-07-16). Scoped to THIS
+        branch so 300+ parallel workers don't all contend on the same rows, and
+        age-gated so a legitimately in-flight import of the same branch is never
+        stolen. Every branch self-heals on its next import."""
+        if not self.branch_id:
+            return 0
+        self.cur.execute(
+            "UPDATE ingest.import_runs SET status = 'stale', finished_at = now(), "
+            "error_log = COALESCE(error_log, '') || "
+            "  '[reaper] still ''running'' after ' || %s || '; process died without "
+            "finishing (killed / OOM / lost connection)' "
+            "WHERE branch_id = %s AND status = 'running' "
+            "  AND started_at < now() - %s::interval",
+            (older_than, self.branch_id, older_than))
+        n = self.cur.rowcount
+        self.conn.commit()
+        if n:
+            log.warning("reaped %d stale 'running' import_run(s) for this branch", n)
+        return n
+
     def start_run(self, run_type: str, total: int):
+        self.reap_stale_runs()
         row = self._one(
             "INSERT INTO ingest.import_runs "
             "(source_system_id, retailer_id, branch_id, run_type, status, "
@@ -705,6 +780,19 @@ class Importer:
             "price_changes = %s, new_products = %s, error_log = %s WHERE id = %s",
             (status, self.inserted, self.updated, self.failed, self.price_changes,
              self.new_products, error_log, self.run_id))
+        # catalog.branches.last_scraped_at had NO writer at all: the scrapers
+        # stamp it on store_branches in the app's OPERATIONAL Supabase, which is
+        # a different database from pico-prod, so all 393 rows here sat NULL
+        # forever. The importer is pico-prod's only writer, so it stamps it —
+        # GREATEST() keeps the newest scrape when branches import out of order,
+        # and only on success so a failed import can't advertise fresh data.
+        if status == "success" and self.branch_id and self.max_observed_at:
+            self.cur.execute(
+                "UPDATE catalog.branches SET last_scraped_at = "
+                "  GREATEST(COALESCE(last_scraped_at, '-infinity'::timestamptz), %s::timestamptz), "
+                "  updated_at = now() "
+                "WHERE id = %s",
+                (self.max_observed_at, self.branch_id))
 
     # ===================================================================== #
     # BATCH PROCESSING — replaces the old one-record-at-a-time process()
@@ -727,6 +815,16 @@ class Importer:
         brand_cache_snapshot = dict(self._brand_cache)
         promo_cache_snapshot = dict(self._promo_cache)
         counter_snapshot = self._counter_snapshot()
+        # Only track the scrape high-water mark for batches that will actually be
+        # committed: --rollback-test still calls finish_run('success'), so letting
+        # it accumulate here would stamp branches.last_scraped_at for data that
+        # was deliberately rolled back. ISO-8601 UTC ('...Z') sorts correctly as
+        # a plain string — all scrapers emit exactly that format.
+        if commit:
+            seen = [rec["observed_at"] for rec in batch if rec.get("observed_at")]
+            if seen:
+                self.max_observed_at = max(seen + ([self.max_observed_at]
+                                                   if self.max_observed_at else []))
         try:
             for rec in batch:
                 _, _, _, _, _, rec["_norm_size"] = parse_size(rec.get("size"))
@@ -747,6 +845,12 @@ class Importer:
             rp_ids, canonical_ids, variant_ids, is_new = self._bulk_upsert_retailer_products(batch, Jsonb)
 
             self._bulk_match(batch, rp_ids, canonical_ids, variant_ids)
+
+            # After matching: any barcode the matcher had to create now exists, so
+            # this sees the complete set. (Ordering also matters for locking — the
+            # advisory lock is already held by then, so this never introduces a
+            # new lock-acquisition order.)
+            self._bulk_touch_identifiers(batch)
 
             for is_n in is_new:
                 if is_n:
@@ -816,24 +920,64 @@ class Importer:
     def _bulk_upsert_retailer_products(self, batch: list[dict], Jsonb):
         n = len(batch)
         spids = [rec["source_product_id"] for rec in batch if rec["source_product_id"]]
-        skus_no_spid = [rec["retailer_sku"] for rec in batch
-                         if not rec["source_product_id"] and rec["retailer_sku"]]
+        all_skus = [rec["retailer_sku"] for rec in batch if rec["retailer_sku"]]
 
         existing: dict[tuple, tuple] = {}  # (kind, key) -> (id, canonical_id, variant_id)
-        if spids or skus_no_spid:
+        # sku -> (id, canonical_id, variant_id) of whichever row already OWNS it.
+        # catalog.retailer_products has TWO unique constraints —
+        # (retailer_id, source_product_id) AND (retailer_id, retailer_sku) — and the
+        # ON CONFLICT below can only arbitrate on one of them, so a collision on
+        # retailer_sku still 23505s on ..._retailer_sku_key. That is NOT a race:
+        # two rows in the SAME export with different source_product_ids sharing one
+        # retailer_sku fail identically on every one of the 10 batch retries and
+        # kill the branch (the duplicate-key failures reported 2026-07-16). So every
+        # sku in the batch is looked up here — not just the spid-less ones, as
+        # before — and a sku already spoken for is dropped rather than fought over.
+        sku_owner: dict[str, tuple] = {}
+        if spids or all_skus:
             rows = self._all(
                 "SELECT id, canonical_product_id, product_variant_id, source_product_id, retailer_sku "
                 "FROM catalog.retailer_products WHERE retailer_id = %s "
-                "AND (source_product_id = ANY(%s) "
-                "     OR (source_product_id IS NULL AND retailer_sku = ANY(%s)))",
-                (self.retailer_id, spids or [], skus_no_spid or []))
+                "AND (source_product_id = ANY(%s) OR retailer_sku = ANY(%s))",
+                (self.retailer_id, spids or [], all_skus or []))
             for rp_id, cid, vid, spid, sku in rows:
                 key = ("spid", spid) if spid else ("sku", sku)
                 existing[key] = (rp_id, cid, vid)
+                if sku:
+                    sku_owner[sku] = (rp_id, cid, vid)
 
         def ident(rec):
             return ("spid", rec["source_product_id"]) if rec["source_product_id"] \
                 else ("sku", rec["retailer_sku"])
+
+        # Which batch row gets to keep a contested sku. Records with NO
+        # source_product_id are IDENTIFIED by their retailer_sku, so they claim
+        # first — take it away and ident() keys on None and the row loses its
+        # identity entirely. dedupe() guarantees at most one spid-less record per
+        # sku, so these pre-claims never fight each other; the only possible
+        # in-batch rival is a spid-bearing row, which can safely give the sku up.
+        claimed: dict[str, int] = {}
+        for i, rec in enumerate(batch):
+            if not rec["source_product_id"] and rec["retailer_sku"]:
+                claimed.setdefault(rec["retailer_sku"], i)
+
+        def sku_for(i: int, rec: dict, rp_id: Optional[str]) -> Optional[str]:
+            """The retailer_sku this row may safely write, or None. Dropping one is
+            lossless in practice: NULL is exempt from the unique index, the UPDATE
+            path COALESCEs (so an existing good value is kept), and a spid-bearing
+            row is identified by its spid anyway. It only declines to STEAL a sku
+            another row already holds."""
+            sku = rec["retailer_sku"]
+            if not sku:
+                return None
+            owner = sku_owner.get(sku)
+            if owner and owner[0] != rp_id:
+                self.sku_conflicts += 1
+                return None          # a different retailer_product already holds it
+            if claimed.setdefault(sku, i) != i:
+                self.sku_conflicts += 1
+                return None          # an earlier row in THIS batch already took it
+            return sku
 
         rp_ids: list[Optional[str]] = [None] * n
         canonical_ids: list[Optional[str]] = [None] * n
@@ -844,10 +988,16 @@ class Importer:
         new_idxs = []
         for i, rec in enumerate(batch):
             hit = existing.get(ident(rec))
+            if hit is None and not rec["source_product_id"] and rec["retailer_sku"]:
+                # No spid, so the sku IS this row's identity. If a row that DOES
+                # have a spid already owns that sku it is the same product at the
+                # same retailer — reuse it instead of inserting a second row that
+                # would collide on (retailer_id, retailer_sku).
+                hit = sku_owner.get(rec["retailer_sku"])
             if hit:
                 rp_ids[i], canonical_ids[i], variant_ids[i] = hit
                 update_rows.append((
-                    rp_ids[i], rec["retailer_sku"], rec["raw_name"], rec["clean_name"],
+                    rp_ids[i], sku_for(i, rec, rp_ids[i]), rec["raw_name"], rec["clean_name"],
                     rec["brand"], rec["category_path"], rec["product_url"], rec["image_url"],
                     rec["barcode"], Jsonb(rec["raw_row"] or {}),
                 ))
@@ -887,23 +1037,73 @@ class Importer:
             # have matching defaults (checked against the live schema), so they
             # don't need to be in the INSERT.
             new_rows = [(
-                self.retailer_id, batch[i]["retailer_sku"], batch[i]["raw_name"],
+                self.retailer_id, sku_for(i, batch[i], None), batch[i]["raw_name"],
                 batch[i]["clean_name"], batch[i]["brand"], batch[i]["category_path"],
                 batch[i]["product_url"], batch[i]["image_url"], batch[i]["barcode"],
                 batch[i]["source_product_id"], Jsonb(batch[i]["raw_row"] or {}), "unmatched",
             ) for i in new_idxs]
-            new_ids = self._bulk_insert(
-                "catalog.retailer_products",
-                ("retailer_id", "retailer_sku", "raw_name", "clean_name", "brand_text",
-                 "raw_category_path", "product_url", "image_url", "barcode",
-                 "source_product_id", "raw_latest", "match_status"),
-                ("uuid", "text", "text", "text", "text", "text", "text", "text", "text",
-                 "text", "jsonb", "text"),
+            # ON CONFLICT DO NOTHING instead of a bare INSERT: under --jobs>1 two
+            # branches can both SELECT-miss the SAME brand-new shared product and
+            # race to INSERT it. A bare INSERT makes the loser 23505 and forces a
+            # whole-batch retry (which livelocks big batches — see the jobs-4/8k
+            # Pak'nSave run: 6 branches died on retailer_products_..._key). DO
+            # NOTHING lets the loser's row be silently skipped; RETURNING then
+            # yields ONLY the rows THIS worker actually inserted (that's the
+            # is_new set, canonical still NULL -> matcher creates it). The raced
+            # rows the winner already committed are fetched below by natural key
+            # and REUSED — no duplicate canonical, no double-count. Results are
+            # mapped to records BY KEY (spid/sku), never by RETURNING position,
+            # so a shuffled result set can never mislink a product to the wrong
+            # canonical. TARGETED at (retailer_id, source_product_id) — the exact
+            # constraint that races — NOT a bare `ON CONFLICT DO NOTHING`: a
+            # target-less form would also swallow a conflict on some OTHER unique
+            # index (e.g. barcode), and that skipped row wouldn't be found by the
+            # spid/sku re-SELECT below -> KeyError. Any non-spid conflict instead
+            # falls through to 23505 and the existing transient-retry path. Rows
+            # with NULL source_product_id never match this index, so they always
+            # insert and appear in RETURNING.
+            frag, params = self._unnest_sql(
                 new_rows,
-                returning="id")
-            for pos, i in enumerate(new_idxs):
-                rp_ids[i] = new_ids[pos]
-                is_new[i] = True
+                ("uuid", "text", "text", "text", "text", "text", "text", "text", "text",
+                 "text", "jsonb", "text"))
+            self.cur.execute(
+                "INSERT INTO catalog.retailer_products "
+                "(retailer_id, retailer_sku, raw_name, clean_name, brand_text, "
+                " raw_category_path, product_url, image_url, barcode, source_product_id, "
+                " raw_latest, match_status) "
+                f"SELECT * FROM {frag} "
+                "ON CONFLICT (retailer_id, source_product_id) DO NOTHING "
+                "RETURNING id, source_product_id, retailer_sku",
+                params)
+            inserted_by_key: dict[tuple, str] = {}
+            for rid, spid, sku in self.cur.fetchall():
+                inserted_by_key[("spid", spid) if spid else ("sku", sku)] = rid
+
+            # Anything in new_idxs NOT returned above lost an insert race — the
+            # winner's row is already committed; fetch its id + existing
+            # canonical/variant so we reuse (never recreate) them.
+            raced = [i for i in new_idxs if ident(batch[i]) not in inserted_by_key]
+            raced_by_key: dict[tuple, tuple] = {}
+            if raced:
+                r_spids = [batch[i]["source_product_id"] for i in raced if batch[i]["source_product_id"]]
+                r_skus = [batch[i]["retailer_sku"] for i in raced
+                          if not batch[i]["source_product_id"] and batch[i]["retailer_sku"]]
+                for rid, cid, vid, spid, sku in self._all(
+                    "SELECT id, canonical_product_id, product_variant_id, source_product_id, retailer_sku "
+                    "FROM catalog.retailer_products WHERE retailer_id = %s "
+                    "AND (source_product_id = ANY(%s) "
+                    "     OR (source_product_id IS NULL AND retailer_sku = ANY(%s)))",
+                    (self.retailer_id, r_spids or [], r_skus or [])):
+                    raced_by_key[("spid", spid) if spid else ("sku", sku)] = (rid, cid, vid)
+
+            for i in new_idxs:
+                key = ident(batch[i])
+                if key in inserted_by_key:
+                    rp_ids[i] = inserted_by_key[key]
+                    is_new[i] = True  # genuinely inserted by us; matcher creates its canonical
+                else:
+                    # lost the race: reuse the winner's row + its canonical/variant
+                    rp_ids[i], canonical_ids[i], variant_ids[i] = raced_by_key[key]
 
         return rp_ids, canonical_ids, variant_ids, is_new
 
@@ -929,22 +1129,76 @@ class Importer:
             # cache only tracks brands seen so far *in this run*, so a brand
             # already in the DB from a prior import (e.g. "Pams" on any repeat
             # scrape of an already-imported branch) would otherwise 23505.
-            names = list(to_resolve.values())
-            values_sql, params = self._values_sql([(n,) for n in names], ("text",))
+            # Sorted by normalized_name so every parallel worker takes the brand
+            # row locks in the SAME order. Unsorted, two workers whose batches
+            # share brands in different orders lock them head-on and deadlock
+            # (observed as DeadlockDetected in relation "brands").
+            items = sorted(to_resolve.items())  # [(normalized_name, original_text)]
+            values_sql, params = self._values_sql([(n,) for _, n in items], ("text",))
             self.cur.execute(
                 f"INSERT INTO catalog.brands (name) VALUES {values_sql} "
                 "ON CONFLICT (normalized_name) DO UPDATE SET name = catalog.brands.name "
-                "RETURNING id",
+                "RETURNING id, normalized_name",
                 params)
-            ids = [r[0] for r in self.cur.fetchall()]
-            for norm, bid in zip(to_resolve.keys(), ids):
-                self._brand_cache[norm] = bid
+            # Mapped BY KEY off the returned normalized_name, never by RETURNING
+            # position: RETURNING order is not guaranteed to follow VALUES order,
+            # so zipping ids onto the input list can bind a brand to the WRONG id.
+            returned = {norm: bid for bid, norm in self.cur.fetchall()}
+            for py_norm, text in items:
+                bid = returned.get(py_norm)
+                if bid is None:
+                    # python's db_normalized_name() diverged from the DB's
+                    # GENERATED column (its \s matches unicode spaces like \xa0,
+                    # Postgres' does not), so the returned key isn't the one we
+                    # cache under. Ask the DB rather than drop the brand to NULL.
+                    row = self._one(
+                        "SELECT id FROM catalog.brands WHERE normalized_name = "
+                        "lower(regexp_replace(%s, '\\s+', ' ', 'g'))", (text,))
+                    bid = row[0] if row else None
+                if bid is not None:
+                    self._brand_cache[py_norm] = bid
 
         for i, text in enumerate(brand_texts):
             b = (text or "").strip()
             if b:
                 out[i] = self._brand_cache.get(db_normalized_name(b))
         return out
+
+    # ---- stage: keep global barcode identifiers fresh ----------------------- #
+    def _bulk_touch_identifiers(self, batch: list[dict]) -> None:
+        """Bump last_seen_at on the global barcode rows this batch just observed.
+
+        Without this the column lies. The only writer was the ON CONFLICT DO
+        UPDATE on the create path in _bulk_match, which is reached ONLY for a
+        barcode we believed to be brand new — and _bulk_match returns early for
+        anything already matched, which is every record of every re-import. So a
+        barcode's last_seen_at recorded when we first inserted it and never moved
+        again, however many times we saw the product afterwards.
+
+        Runs from process_batch, NOT from _bulk_match, precisely because the
+        matcher short-circuits on re-imports — the case this is for.
+
+        Deadlock-safe by construction: these rows are global (retailer_id IS
+        NULL), so under --jobs>1 every worker wants overlapping sets of them.
+        FOR UPDATE ... SKIP LOCKED takes only the rows nobody else holds and
+        walks them in a fixed ORDER BY id, so this can never sit head-on against
+        another worker. A row skipped because a sibling had it is simply left for
+        next time — the sibling is bumping it to the same now() anyway.
+        """
+        barcodes = sorted({rec["barcode"] for rec in batch if rec["barcode"]})
+        if not barcodes:
+            return
+        self.cur.execute(
+            "UPDATE catalog.product_identifiers SET last_seen_at = now() "
+            "WHERE id IN ("
+            "  SELECT id FROM catalog.product_identifiers "
+            "   WHERE identifier_type = ANY(%s::catalog.product_identifier_type[]) "
+            "     AND retailer_id IS NULL "
+            "     AND identifier_value = ANY(%s) "
+            "     AND last_seen_at < now() - %s::interval "  # NOT NULL in the schema
+            "   ORDER BY id FOR UPDATE SKIP LOCKED)",
+            (list(BARCODE_IDENTIFIER_TYPES), barcodes, IDENTIFIER_TOUCH_AFTER))
+        self.identifiers_touched += self.cur.rowcount
 
     # ---- stage: matching ----------------------------------------------------- #
     def _bulk_match(self, batch: list[dict], rp_ids: list, canonical_ids: list, variant_ids: list) -> None:
@@ -1062,7 +1316,7 @@ class Importer:
                 # (that's why they reached this "creator" branch) — so bar a
                 # concurrent writer racing us between the two queries, every
                 # row here is a genuinely new global identifier.
-                values_sql, params = self._values_sql(
+                frag, params = self._unnest_sql(
                     id_rows, ("uuid", "uuid", "text", "text"))
                 self.cur.execute(
                     "INSERT INTO catalog.product_identifiers "
@@ -1070,7 +1324,7 @@ class Importer:
                     " identifier_value, is_primary, source, first_seen_at, last_seen_at) "
                     "SELECT v.product_variant_id, v.canonical_product_id, NULL, 'barcode', "
                     "       v.identifier_value, true, v.source, now(), now() "
-                    f"FROM (VALUES {values_sql}) AS v(product_variant_id, canonical_product_id, "
+                    f"FROM {frag} AS v(product_variant_id, canonical_product_id, "
                     "identifier_value, source) "
                     "ON CONFLICT (identifier_type, identifier_value) WHERE retailer_id IS NULL "
                     "AND identifier_type = ANY(ARRAY['barcode','gtin','ean','upc']"
@@ -1202,7 +1456,7 @@ class Importer:
                 extra_set="updated_at = now()")
 
         if review_insert_rows:
-            values_sql, params = self._values_sql(
+            frag, params = self._unnest_sql(
                 review_insert_rows,
                 ("uuid", "uuid", "uuid", "text", "text", "numeric", "jsonb"))
             self.cur.execute(
@@ -1210,7 +1464,7 @@ class Importer:
                 "(retailer_product_id, suggested_canonical_product_id, suggested_product_variant_id, "
                 " review_reason, status, score, raw_evidence) "
                 f"SELECT v.rp_id, v.scid, v.svid, v.reason, v.status, v.score, v.evidence "
-                f"FROM (VALUES {values_sql}) AS v(rp_id, scid, svid, reason, status, score, evidence) "
+                f"FROM {frag} AS v(rp_id, scid, svid, reason, status, score, evidence) "
                 "ON CONFLICT (retailer_product_id, review_reason) WHERE status = 'open' DO UPDATE SET "
                 "suggested_canonical_product_id = EXCLUDED.suggested_canonical_product_id, "
                 "suggested_product_variant_id = EXCLUDED.suggested_product_variant_id, "
@@ -1310,7 +1564,7 @@ class Importer:
             # false, violating promotions_loyalty_program_requires_card_check
             # (card_required OR required_loyalty_program_id IS NULL). Caught by
             # a real 12,000-row-in run failure — see conversation/commit history.
-            values_sql, params = self._values_sql(
+            frag, params = self._unnest_sql(
                 existing_update_rows,
                 ("uuid", "boolean", "uuid", "timestamptz", "timestamptz", "jsonb"))
             self.cur.execute(
@@ -1325,7 +1579,7 @@ class Importer:
                 # refresh badges only when this run actually carried some
                 "metadata = CASE WHEN v.metadata = '{}'::jsonb THEN t.metadata ELSE v.metadata END, "
                 "is_active = true, updated_at = now() "
-                f"FROM (VALUES {values_sql}) AS v(id, card_required, required_loyalty_program_id, "
+                f"FROM {frag} AS v(id, card_required, required_loyalty_program_id, "
                 "starts_at, ends_at, metadata) "
                 "WHERE t.id = v.id",
                 params)
@@ -1349,7 +1603,29 @@ class Importer:
         bpc_id_by_idx: list[Optional[str]] = [None] * n
         history_rows = []  # (bpc_id, rp_id, cid, vid, promo_id, rec, old_price, old_unit, old_stock)
 
+        # Two batch records can resolve to the SAME retailer_product — e.g. a
+        # spid-less record whose retailer_sku is owned by a spid-bearing row (see
+        # sku_for in _bulk_upsert_retailer_products). branch_product_current is
+        # UNIQUE (branch_id, retailer_product_id), so letting both through inserts
+        # the same pair twice: a 23505 that is NOT transient — it reproduces
+        # identically on all MAX_BATCH_RETRIES attempts and kills the branch.
+        # Collapse them, LAST occurrence winning (the freshest observation, which
+        # is what per-record sequential processing would have left behind), and
+        # point the losers at the winner's bpc id so promotion_items still links.
+        winner_for_rp: dict[str, int] = {}
+        for i in range(n):
+            if rp_ids[i] is not None:
+                winner_for_rp[rp_ids[i]] = i
+        dup_idxs = [i for i in range(n)
+                    if rp_ids[i] is not None and winner_for_rp[rp_ids[i]] != i]
+        if dup_idxs:
+            log.debug("%d record(s) collapsed onto an already-claimed retailer_product",
+                      len(dup_idxs))
+        skip = set(dup_idxs)
+
         for i, rec in enumerate(batch):
+            if i in skip:
+                continue
             is_special = promo_ids[i] is not None
             hit = existing.get(rp_ids[i])
             if hit:
@@ -1449,11 +1725,22 @@ class Importer:
                  "timestamptz"),
                 hist_ins)
 
-        self._bulk_upsert_promotion_items(batch, rp_ids, bpc_id_by_idx, promo_ids)
+        # Losers inherit the winner's bpc id: they are the same product in the same
+        # branch, so anything keyed off branch_product_id still resolves.
+        for i in dup_idxs:
+            bpc_id_by_idx[i] = bpc_id_by_idx[winner_for_rp[rp_ids[i]]]
 
-    def _bulk_upsert_promotion_items(self, batch, rp_ids, bpc_ids, promo_ids) -> None:
+        self._bulk_upsert_promotion_items(batch, rp_ids, bpc_id_by_idx, promo_ids, skip)
+
+    def _bulk_upsert_promotion_items(self, batch, rp_ids, bpc_ids, promo_ids,
+                                      skip: Optional[set] = None) -> None:
         from psycopg.types.json import Jsonb
-        idxs = [i for i in range(len(batch)) if promo_ids[i] is not None]
+        # `skip` carries the collapsed duplicates from _bulk_upsert_current — they
+        # would insert a second row for the same (promotion_id, retailer_product_id,
+        # branch_product_id), which promotion_items_unique_idx rejects.
+        skip = skip or set()
+        idxs = [i for i in range(len(batch))
+                if promo_ids[i] is not None and i not in skip]
         if not idxs:
             return
         pairs = [(promo_ids[i], rp_ids[i]) for i in idxs]
@@ -1582,6 +1869,45 @@ def run_dry(records: list[dict]) -> int:
     return 0
 
 
+def reap_all_stale_runs(older_than: str = STALE_RUN_AFTER) -> int:
+    """Sweep EVERY branch's abandoned 'running' import_runs, not just the one
+    about to be imported.
+
+    Importer.reap_stale_runs() is deliberately scoped to a single branch so 300+
+    parallel workers don't contend on the same rows — but that means a branch
+    only self-heals when it is next imported, and a branch that stops being
+    imported leaves its orphan 'running' row forever (45 of them by 2026-07-16,
+    some 1-3 days old). This runs ONCE, in the parent process, before any worker
+    starts, so there is no contention and no in-flight run to steal: the age gate
+    means a row must have been untouched for `older_than` to be reaped.
+
+    Marks them 'stale' (ingest.import_runs.status has no CHECK constraint, so
+    that is a legal value) rather than deleting anything.
+    """
+    import psycopg
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        log.error("DATABASE_URL is not set — cannot reap stale runs.")
+        return -1
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ingest.import_runs SET status = 'stale', finished_at = now(), "
+                "error_log = COALESCE(error_log, '') || "
+                "  '[reaper] still ''running'' after ' || %s || '; process died without "
+                "finishing (killed / OOM / lost connection)' "
+                "WHERE status = 'running' AND started_at < now() - %s::interval",
+                (older_than, older_than))
+            n = cur.rowcount
+        conn.commit()
+    if n:
+        log.warning("reaped %d stale 'running' import_run(s) older than %s "
+                    "(marked status='stale')", n, older_than)
+    else:
+        log.info("no stale 'running' import_runs older than %s", older_than)
+    return n
+
+
 def run_db(args, records: list[dict], rollback: bool) -> int:
     import psycopg
     dsn = os.environ.get("DATABASE_URL")
@@ -1700,9 +2026,12 @@ def run_db(args, records: list[dict], rollback: bool) -> int:
         f"  canonicals created: {imp.canonicals_created}",
         f"  variants created  : {imp.variants_created}",
         f"  barcodes linked   : {imp.identifiers_created}",
+        f"  barcodes refreshed: {imp.identifiers_touched} (last_seen_at bumped)",
         f"  reviews resolved  : {imp.reviews_resolved}",
         f"  review queued     : {imp.reviews_created}",
         f"  failed rows       : {imp.failed}",
+        f"  sku conflicts     : {imp.sku_conflicts} (retailer_sku left unwritten, "
+        f"already owned by another row)",
         "======================",
     ]
     for line in summary_lines:
@@ -1755,6 +2084,15 @@ def parse_args(argv=None):
                         "concurrency-safe: canonical-product creation is serialized so "
                         "no duplicates, and same-retailer row deadlocks are retried. "
                         "3-4 is a good, DB-friendly starting point.")
+    p.add_argument("--reap-stale-only", action="store_true",
+                   help="mark every abandoned 'running' import_run older than "
+                        f"{STALE_RUN_AFTER} as 'stale', then exit without importing "
+                        "anything. Use to clean up orphans left by killed/OOMed runs "
+                        "on branches that aren't being re-imported. (--input-dir does "
+                        "this sweep automatically before it starts; --no-reap skips it.)")
+    p.add_argument("--no-reap", action="store_true",
+                   help="skip the chain-wide stale-run sweep that --input-dir "
+                        "normally performs before importing.")
     return p.parse_args(argv)
 
 
@@ -1827,6 +2165,15 @@ def _main_input_dir(args) -> int:
         log.error("no %s_*.jsonl files found in %s", prefix, args.input_dir)
         return 2
 
+    # One chain-wide sweep in the PARENT, before any worker connects: clears
+    # orphan 'running' rows for branches that aren't in this run at all (the
+    # per-branch reaper in start_run only heals branches it actually imports).
+    if not (args.dry_run or args.no_reap):
+        try:
+            reap_all_stale_runs()
+        except Exception:
+            log.exception("stale-run sweep failed — continuing with the import anyway")
+
     jobs = max(1, args.jobs)
     log.info("=== full-chain import: %d branches found for retailer=%s (--jobs %d) ===",
              len(branches), args.retailer, jobs)
@@ -1872,6 +2219,9 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                         datefmt="%H:%M:%S")
     args = parse_args(argv)
+
+    if args.reap_stale_only:
+        return 0 if reap_all_stale_runs() >= 0 else 2
 
     if bool(args.input) == bool(args.input_dir):
         log.error("specify exactly one of --input (single branch) or --input-dir (full chain)")
