@@ -46,7 +46,7 @@ from dotenv import load_dotenv
 # from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from patchright.async_api import async_playwright, Browser, BrowserContext, Page
 from supabase import create_client, Client
-from report_client import post_branch_report
+# from report_client import post_branch_report  # disabled for server deploy (no monitor UI)
 from jsonl_export import write_jsonl, to_cents, clean_record
 
 # ---------------------------------------------------------------------------
@@ -2333,18 +2333,19 @@ class FoodstuffsScraper:
                 sample_oos = [p.clean_name for p in all_products if not p.in_stock][:5]
                 logger.info(f"[oos] {out_of_stock}/{len(all_products)} — sample: {sample_oos}")
 
-            await loop.run_in_executor(None, lambda: post_branch_report(
-                chain=self.cfg["name"],
-                branch_name=self.branch_name,
-                branch_id=str(self.branch_id) if self.branch_id else None,
-                store_id=str(self.api_store_id) if self.api_store_id else None,
-                status=status,
-                total_products=len(all_products),
-                categories=stats["category_results"],
-                price_changes=stats["price_changes"],
-                specials=specials,
-                out_of_stock=out_of_stock,
-            ))
+            # disabled for server deploy (no monitor UI):
+            # await loop.run_in_executor(None, lambda: post_branch_report(
+            #     chain=self.cfg["name"],
+            #     branch_name=self.branch_name,
+            #     branch_id=str(self.branch_id) if self.branch_id else None,
+            #     store_id=str(self.api_store_id) if self.api_store_id else None,
+            #     status=status,
+            #     total_products=len(all_products),
+            #     categories=stats["category_results"],
+            #     price_changes=stats["price_changes"],
+            #     specials=specials,
+            #     out_of_stock=out_of_stock,
+            # ))
         except Exception as e:
             logger.exception("run failed")
             await loop.run_in_executor(None, lambda: self._end_run(run_id, "failed", stats, error=str(e)))

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import copy
 import json
 import logging
@@ -57,7 +58,7 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from supabase import create_client, Client
-from report_client import post_branch_report
+# from report_client import post_branch_report  # disabled for server deploy (no monitor UI)
 from jsonl_export import write_jsonl, to_cents, clean_record
 
 # ---------------------------------------------------------------------------
@@ -981,7 +982,14 @@ class WoolworthsClaudeScraper:
 
         # Retailer badges drive classification — never infer half-price from the
         # 50%-off maths (a deep clearance is not a half-price promo).
-        tags = item.get("productTags") or []
+        # FIELD-NAME SPLIT: the LISTING api sends `productTag` (a single object);
+        # only the per-sku DETAIL api sends `productTags` (a list). Reading just
+        # the plural meant every listing badge/multiBuy was silently dropped —
+        # 0 multibuy across 6,451 specials. Merge both spellings.
+        tags = list(item.get("productTags") or [])
+        single_tag = item.get("productTag")
+        if isinstance(single_tag, dict):
+            tags.append(single_tag)
         tag_types = [str(t.get("tagType")).strip() for t in tags
                      if isinstance(t, dict) and t.get("tagType")]
         if tag_types:
@@ -1014,11 +1022,28 @@ class WoolworthsClaudeScraper:
                 promo_type = "multibuy_fixed_price"
             else:
                 promo_type = "special"
-            save = price_data.get("savePrice")
-            if save:
-                promo_text = f"Save ${float(save):.2f}"
         elif multibuy_quantity:
             promo_type = "multibuy_fixed_price"
+
+        # Display label, mirroring the site's own badge hierarchy ("2 for $3.50",
+        # "1/2 Price", "25% Off", "Save $1.30"). Built here — NOT in the importer —
+        # because badge semantics are chain-specific and the importer is a dumb
+        # copier. Convenience only: the structured fields (multibuy_*, *_cents,
+        # savePercentage in raw) remain the source of truth for any UI/SQL.
+        if promo_type is not None:
+            try:
+                save_f = float(price_data.get("savePrice") or 0)
+                pct_f = float(price_data.get("savePercentage") or 0)
+            except (TypeError, ValueError):
+                save_f = pct_f = 0.0
+            if multibuy_quantity and multibuy_price_cents:
+                promo_text = f"{multibuy_quantity} for ${multibuy_price_cents / 100:.2f}"
+            elif promo_type == "half_price":
+                promo_text = "1/2 Price"
+            elif pct_f > 0:
+                promo_text = f"{pct_f:g}% Off"
+            elif save_f > 0:
+                promo_text = f"Save ${save_f:.2f}"
 
         if promo_type is None:
             # No active promotion — don't attach stray promo dates/badges.
@@ -1086,7 +1111,9 @@ class WoolworthsClaudeScraper:
         from the shared cache. Read-only and instant — NEVER live-fetches, so the
         JSONL export is never blocked behind detail requests. Whatever the shared
         cache has been warmed with so far is applied; the rest is filled in by
-        warm_detail_cache() after the export (and by later branches / re-runs)."""
+        fetch_details() after the export (and by later branches / re-runs).
+        Promo dates do NOT come from here — fetch_details() applies them to the
+        branch's products directly; the cache never holds them."""
         skus = {p.sku for p in products if p.sku}
         applied = 0
         for p in products:
@@ -1104,17 +1131,28 @@ class WoolworthsClaudeScraper:
             f"({cached}/{len(skus)} SKUs cached)"
         )
 
-    async def warm_detail_cache(self, products: list[ScrapedProduct], *, block: bool = False) -> None:
-        """Live-fetch the static detail card for cache-miss SKUs into the shared
-        on-disk cache. Only ONE branch fetches at a time (global lock) so concurrent
-        branches never stampede WW's Akamai detail endpoint. Detail is product-global,
-        so this warms the cache for all branches rather than re-fetching per store.
+    async def fetch_details(self, products: list[ScrapedProduct]) -> None:
+        """Fetch the rich card (nutrition/allergens/breadcrumb) for cache-miss SKUs.
 
-        block=False (best-effort): if another branch already holds the lock, skip.
-        block=True: wait for the lock and warm before returning — used pre-export so
-        THIS branch's JSONL carries the full breadcrumb category + origin/nutrition."""
-        skus = {p.sku for p in products if p.sku}
-        to_fetch = [s for s in skus if not self._detail_cache.has(s)]
+        The card is static and cached product-globally on disk, so only the first
+        branch ever to see a SKU pays the request — once the cache is warm this is
+        ~dozens of fetches per branch, not thousands.
+
+        Promo data deliberately does NOT come from here: everything the site's
+        specials page shows (was/now, save $/%, multibuy, badges, club price) is
+        already in the LISTING response, and per-SKU promo-DATE fetching was
+        removed — it cost ~5,900 requests per branch every run for dates we don't
+        use. promo_starts_at/ends_at stay null unless the listing starts sending
+        them (see EnableReturnOfPromotionStartAndEndDate in their feature flags).
+
+        Serialized across branches by a global lock so concurrent branches never
+        stampede Akamai. Endpoint facts (measured 2026-07-17): responses take
+        ~10s flat, so throughput is concurrency/latency and the timeout must sit
+        well above 10s — at 15s the tail of every batch died (10% TimeoutError),
+        at 45s failures were zero.
+        """
+        miss_skus = {p.sku for p in products if p.sku and not self._detail_cache.has(p.sku)}
+        to_fetch = sorted(miss_skus)
         if not to_fetch or not self._page:
             return
         headers = {
@@ -1122,22 +1160,22 @@ class WoolworthsClaudeScraper:
             if k.lower() not in ("host", "content-length")
         }
         fetched = failed = 0
+        # Outcomes are counted, not swallowed: a blanket `except: pass` made a
+        # blocked request and an HTTP error look identical, so failures were
+        # undiagnosable. Each bucket points at a different fix.
+        tally: collections.Counter = collections.Counter()
+        first_err: list[str] = []
         lock = get_ww_detail_lock()
-        if lock.locked() and not block:
-            # Another branch is already warming the shared, product-global cache.
-            # Best-effort mode: don't queue behind it — return and free this worker
-            # slot. These SKUs fill from the shared cache once the warm finishes.
-            logger.info(
-                f"  [detail] shared cache already warming elsewhere — skipping "
-                f"({len(to_fetch)} SKUs)"
-            )
-            return
+        t0 = time.time()
         async with lock:
-            # Re-check under the lock — an earlier branch may have warmed these.
+            # Re-check under the lock — an earlier branch may have cached these.
             to_fetch = [s for s in to_fetch if not self._detail_cache.has(s)]
             if not to_fetch:
                 return
-            logger.info(f"  [detail] warming shared cache: {len(to_fetch)} SKUs need API fetch")
+            logger.info(
+                f"  [detail] fetching {len(to_fetch)} cache-miss SKUs → rich card "
+                f"(nutrition/allergens/breadcrumb)"
+            )
             i = 0
             saved_at = 0  # SKUs fetched since the last incremental flush to disk
             try:
@@ -1150,35 +1188,52 @@ class WoolworthsClaudeScraper:
                             assert self._page
                             resp = await self._page.request.get(
                                 WW_DETAIL_API.format(sku=sku), headers=headers,
-                                timeout=15000)  # cap per-request so one hang can't stall the batch
-                            if resp.ok:
-                                return sku, parse_ww_detail(await resp.json())
-                            return sku, None
-                        except Exception:
+                                timeout=45000)
+                            # 45s, not 15s: the endpoint's MEAN latency is ~10s,
+                            # so a 15s cap sat barely above average and killed the
+                            # slow tail of every batch (10% TimeoutError). Aborting
+                            # mid-flight also churns connections, which bot
+                            # detection sees.
+                            if not resp.ok:
+                                tally[f"http_{resp.status}"] += 1
+                                return sku, None
+                            return sku, await resp.json()
+                        except Exception as exc:
+                            tally[type(exc).__name__] += 1
+                            if len(first_err) < 3:
+                                first_err.append(f"{type(exc).__name__}: {str(exc)[:110]}")
                             return sku, None
 
-                    for sku, det in await asyncio.gather(*[fetch_one(s) for s in batch]):
-                        if det is not None:
-                            self._detail_cache.put(sku, det)
-                            fetched += 1
-                        else:
+                    for sku, data in await asyncio.gather(*[fetch_one(s) for s in batch]):
+                        if data is None:
                             failed += 1
-                    # Incrementally persist every ~500 SKUs so an interruption of this
-                    # long one-time warm never throws away hours of fetched detail;
-                    # the next run resumes from the on-disk cache (atomic write).
+                            continue
+                        fetched += 1
+                        if not self._detail_cache.has(sku):
+                            self._detail_cache.put(sku, parse_ww_detail(data))
+                    # Incrementally persist every ~500 SKUs so an interruption never
+                    # throws away hours of fetched detail; the next run resumes from
+                    # the on-disk cache (atomic write).
                     if fetched - saved_at >= WW_DETAIL_SAVE_EVERY:
                         self._detail_cache.save(quiet=True)
                         saved_at = fetched
                     if i % 1000 == 0:
                         logger.info(
-                            f"  [detail] warming… {min(i, len(to_fetch))}/{len(to_fetch)} "
+                            f"  [detail] fetching… {min(i, len(to_fetch))}/{len(to_fetch)} "
                             f"({fetched} ok, {failed} fail)"
                         )
                     await asyncio.sleep(random.uniform(0.1, 0.3))
             finally:
                 # Always flush whatever we fetched — even on Ctrl-C / crash / cancel.
                 self._detail_cache.save()
-        logger.info(f"  [detail] warm done: fetched {fetched}, failed {failed}")
+
+        logger.info(
+            f"  [detail] done: fetched {fetched}, failed {failed} in {time.time() - t0:.0f}s"
+        )
+        if tally:
+            logger.info(f"  [detail] fetch outcomes: {dict(tally.most_common())}")
+        for e in first_err:
+            logger.warning(f"  [detail] sample error: {e}")
 
     # ---- JSONL export (Scraper Data Contract — replaces DB writes) --------
 
@@ -1351,15 +1406,13 @@ class WoolworthsClaudeScraper:
             logger.info(f"TOTAL scraped: {len(all_products)} products")
             self._update_run(run_id, total_scraped=len(all_products))
 
-            # Warm the shared product-global detail cache BEFORE the export so this
-            # branch's JSONL carries the full breadcrumb category (Dept > Aisle >
-            # Shelf) and the rich card (origin/nutrition/allergens/health-star).
-            # Serialized across branches by a global lock; detail is cached product-
-            # globally, so the first branch pays the fetch and later branches mostly
-            # hit the warm cache. This intentionally blocks the export until detail
-            # is fetched — completeness over speed.
+            # Rich card: fetch_details() fetches ONLY cache-miss SKUs (nutrition /
+            # allergens / breadcrumb; ~dozens per branch once the cache is warm),
+            # then attach_cached_details() applies every product's cached card (no
+            # network). All promo data comes from the listing sweep; promo dates
+            # are not fetched at all and stay null.
             if all_products:
-                await self.warm_detail_cache(all_products, block=True)
+                await self.fetch_details(all_products)
                 self.attach_cached_details(all_products)
 
             # --- DATABASE WRITES DISABLED (two-stage contract) ---
@@ -1393,18 +1446,19 @@ class WoolworthsClaudeScraper:
                 sample_oos = [p.clean_name for p in all_products if not p.in_stock][:5]
                 logger.info(f"[oos] {out_of_stock}/{len(all_products)} — sample: {sample_oos}")
 
-            post_branch_report(
-                chain="Woolworths",
-                branch_name=self.branch_name,
-                branch_id=str(self.branch_id) if self.branch_id else None,
-                store_id=None,
-                status=status,
-                total_products=len(all_products),
-                categories=stats["category_results"],
-                price_changes=stats["price_changes"],
-                specials=specials,
-                out_of_stock=out_of_stock,
-            )
+            # disabled for server deploy (no monitor UI):
+            # post_branch_report(
+            #     chain="Woolworths",
+            #     branch_name=self.branch_name,
+            #     branch_id=str(self.branch_id) if self.branch_id else None,
+            #     store_id=None,
+            #     status=status,
+            #     total_products=len(all_products),
+            #     categories=stats["category_results"],
+            #     price_changes=stats["price_changes"],
+            #     specials=specials,
+            #     out_of_stock=out_of_stock,
+            # )
         except Exception as e:
             logger.exception("run failed")
             self._end_run(run_id, "failed", stats, error=str(e))
