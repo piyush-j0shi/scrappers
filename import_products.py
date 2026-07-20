@@ -120,24 +120,20 @@ DEFAULT_LOYALTY_BY_RETAILER = {
 
 DEFAULT_BATCH_SIZE = 2000
 
-# Concurrency safety (only engaged when >1 branch imports run at once):
-#  - CANON_CREATE_LOCK: a fixed pg_advisory_xact_lock key taken at the start of
-#    the matching stage ONLY when a batch has products still needing a match
-#    (i.e. new/first-time products). It serializes canonical-product creation
-#    across concurrent importers so two of them can't both "not find, then
-#    create" the same canonical -> duplicate. Held to commit, so a waiter always
-#    sees the winner's committed canonical and reuses it. Re-imports (nothing to
-#    match) skip it entirely -> zero contention on the common path.
-#  - MAX_DEADLOCK_RETRIES: concurrent importers of the SAME retailer write the
-#    shared catalog.retailer_products rows and can deadlock; a deadlock aborts
-#    the batch transaction atomically, so we just retry the whole batch.
-CANON_CREATE_LOCK = 0x1CE5_CA7A_10B  # arbitrary constant, fits in bigint
+# Whole-batch retry for TRANSIENT database errors. Kept after parallelism was
+# removed because these still happen to a lone importer: the Supabase pooler
+# drops a connection, or a statement hits the 2-minute statement_timeout.
+# process_batch aborts and resets its side effects atomically, so a batch is
+# always safe to re-run from a clean slate.
 MAX_BATCH_RETRIES = 10
-# Bound the wait for the creation advisory lock so a contended waiter fails fast
-# with a clean, retryable LockNotAvailable instead of blocking until Supabase's
-# 2-minute statement_timeout fires (which cancels the statement AND drops the
-# connection — the cause of the concurrent-run branch failures).
-CREATE_LOCK_TIMEOUT = "8s"
+# PARALLELISM REMOVED 2026-07-20. The importer is single-process by design now.
+# What went: --jobs, the ProcessPoolExecutor sweep, _worker_import, and the
+# CANON_CREATE_LOCK advisory lock that serialized canonical creation across
+# workers. Measured reason: the lock was held from _bulk_match all the way to
+# commit — i.e. across nearly the whole batch — so --jobs 4 produced a dead-even
+# 13.2s commit cadence (one batch at a time, zero overlap) plus 34 wasted
+# whole-batch retries from lock_timeout. Effective parallelism was ~1x with
+# strictly negative overhead. One process doing uncontended work is faster.
 # An import_run still 'running' after this long has lost its process (finish_run
 # is best-effort and never runs on SIGKILL/OOM/connection loss). Comfortably
 # longer than the slowest observed single-branch import (~15 min) so a live run
@@ -150,6 +146,12 @@ STALE_RUN_AFTER = "2 hours"
 # per run (millions of pointless row versions, WAL, and vacuum debt) to record
 # information that only needs to be accurate to within a scrape cycle.
 IDENTIFIER_TOUCH_AFTER = "12 hours"
+# Per-row freshness columns (retailer_products.last_seen_at,
+# branch_product_current.scraped_at/last_seen_at) cost a heap rewrite of EVERY
+# row on EVERY import even when nothing about the product changed. Set
+# IMPORTER_TOUCH_UNCHANGED=0 to skip them and rely on branch-level freshness
+# (catalog.branches.last_scraped_at + the full-branch out-of-stock sweep).
+TOUCH_UNCHANGED = os.environ.get("IMPORTER_TOUCH_UNCHANGED", "1") != "0"
 
 # --retailer slug (DB, catalog.retailers.slug) -> export filename prefix
 # ({scraper_name} passed to jsonl_export.write_jsonl — confirmed straight from
@@ -513,11 +515,29 @@ class Importer:
         self.variants_created = 0
         self.identifiers_created = 0
         self.identifiers_touched = 0
+        self.stage_times: dict[str, float] = {}
+        # split of the re-import write path (see _copy_update)
+        self.changed_rows = 0
+        self.unchanged_rows = 0
         # retailer_sku values this run declined to write because another row already
         # owned them (see sku_for). Non-fatal, but a high count means the export has
         # a lot of sku reuse and is worth reporting rather than silently swallowing.
         self.sku_conflicts = 0
         self._seen_retailer_product_ids: set[str] = set()
+
+    # ---- stage profiling ---------------------------------------------------- #
+    # Where the wall-clock actually goes, per stage, accumulated across every
+    # batch and printed in the summary. Optimising without this is guesswork.
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _stage(self, name: str):
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            dt = time.perf_counter() - t0
+            self.stage_times[name] = self.stage_times.get(name, 0.0) + dt
 
     def _one(self, sql: str, params: tuple = ()):  # first row or None
         self.cur.execute(sql, params)
@@ -533,7 +553,8 @@ class Importer:
     _BATCH_COUNTERS = ("inserted", "updated", "price_changes", "new_products",
                        "reviews_created", "reviews_resolved", "matched",
                        "canonicals_created", "variants_created", "identifiers_created",
-                       "identifiers_touched", "sku_conflicts")
+                       "identifiers_touched", "sku_conflicts",
+                       "changed_rows", "unchanged_rows")
 
     def _counter_snapshot(self) -> dict:
         return {k: getattr(self, k) for k in self._BATCH_COUNTERS}
@@ -642,20 +663,49 @@ class Importer:
 
     def _copy_update(self, target: str, temp: str, temp_ddl: str,
                      cols: tuple, rows: list[tuple], set_sql: str,
-                     key: str = "id") -> int:
+                     key: str = "id", changed_sql: Optional[str] = None,
+                     touch_sql: Optional[str] = None) -> int:
         """COPY `rows` into an ephemeral TEMP staging table, then
         `UPDATE target FROM staging`. The TEMP table is ON COMMIT DROP — pure
         scratch tied to this transaction; it never touches real catalog data and
         is auto-discarded at commit/rollback (no DELETE/DROP issued here).
-        `set_sql` references staging as `v` and the target as `t`."""
+        `set_sql` references staging as `v` and the target as `t`.
+
+        `changed_sql` + `touch_sql` split the write in two, which is the single
+        biggest speed win in the importer. A re-import re-sends every row, but
+        almost nothing has actually changed (measured: 17,642 rows "updated" for
+        20 real price changes). Rewriting them all is not free — each one is a
+        new heap tuple, new index entries for any indexed column it touches, plus
+        TOAST churn for wide jsonb, plus the WAL for all of it.
+
+        So: rows that genuinely differ take the full UPDATE; every other row gets
+        only `touch_sql`, which sets nothing but freshness columns. Because those
+        columns carry no index, Postgres can apply it as a HOT (heap-only tuple)
+        update — no index maintenance at all — and there is no jsonb to re-TOAST.
+
+        Order matters. The touch runs FIRST: it writes only columns that
+        `changed_sql` does not read, so the second statement still evaluates its
+        predicate against the original values. Run the other way round, the full
+        UPDATE would make the rows match and the touch would then re-hit every
+        row it had just skipped."""
         if not rows:
             return 0
         self.cur.execute(f"CREATE TEMP TABLE {temp} ({temp_ddl}) ON COMMIT DROP")
         with self.cur.copy(f"COPY {temp} ({','.join(cols)}) FROM STDIN") as cp:
             for row in rows:
                 cp.write_row(row)
+        where = f"t.{key} = v.{key}"
+        if changed_sql and not TOUCH_UNCHANGED:
+            where += f" AND ({changed_sql})"
+        elif changed_sql and touch_sql:
+            self.cur.execute(
+                f"UPDATE {target} AS t SET {touch_sql} FROM {temp} AS v "
+                f"WHERE {where} AND NOT ({changed_sql})")
+            self.unchanged_rows += self.cur.rowcount
+            where += f" AND ({changed_sql})"
         self.cur.execute(
-            f"UPDATE {target} AS t SET {set_sql} FROM {temp} AS v WHERE t.{key} = v.{key}")
+            f"UPDATE {target} AS t SET {set_sql} FROM {temp} AS v WHERE {where}")
+        self.changed_rows += self.cur.rowcount
         return self.cur.rowcount
 
     # ---- resolution (small, one-off — not batch-sensitive) ----------------- #
@@ -842,23 +892,29 @@ class Importer:
             # DISABLED 2026-07-14 (per request): skip scraped_observations write.
             # self._bulk_insert_observations(batch, Jsonb)
 
-            rp_ids, canonical_ids, variant_ids, is_new = self._bulk_upsert_retailer_products(batch, Jsonb)
+            with self._stage("prep"):
+                pass
+            with self._stage("retailer_products"):
+                rp_ids, canonical_ids, variant_ids, is_new = \
+                    self._bulk_upsert_retailer_products(batch, Jsonb)
 
-            self._bulk_match(batch, rp_ids, canonical_ids, variant_ids)
+            with self._stage("match"):
+                self._bulk_match(batch, rp_ids, canonical_ids, variant_ids)
 
             # After matching: any barcode the matcher had to create now exists, so
-            # this sees the complete set. (Ordering also matters for locking — the
-            # advisory lock is already held by then, so this never introduces a
-            # new lock-acquisition order.)
-            self._bulk_touch_identifiers(batch)
+            # this sees the complete set.
+            with self._stage("identifiers"):
+                self._bulk_touch_identifiers(batch)
 
             for is_n in is_new:
                 if is_n:
                     self.new_products += 1
 
-            promo_ids = self._bulk_upsert_promotions(batch)
+            with self._stage("promotions"):
+                promo_ids = self._bulk_upsert_promotions(batch)
 
-            self._bulk_upsert_current(batch, rp_ids, canonical_ids, variant_ids, promo_ids)
+            with self._stage("current+history+items"):
+                self._bulk_upsert_current(batch, rp_ids, canonical_ids, variant_ids, promo_ids)
         except Exception:
             # Abort atomically and reset every side effect so the batch can be
             # retried from a clean slate (or so an aborted rollback-test batch
@@ -1027,7 +1083,22 @@ class Importer:
                 "image_url = COALESCE(v.image_url, t.image_url), "
                 "barcode = COALESCE(v.barcode, t.barcode), "
                 "raw_latest = COALESCE(NULLIF(v.raw_latest, '{}'::jsonb), t.raw_latest), "
-                "last_seen_at = now(), is_active = true, updated_at = now()")
+                "last_seen_at = now(), is_active = true, updated_at = now()",
+                # Cheap scalars first — OR short-circuits left to right, so a row
+                # that differs on a name/url never pays for the jsonb comparison.
+                # raw_latest goes last precisely because it has to detoast.
+                changed_sql=(
+                    "t.raw_name IS DISTINCT FROM v.raw_name"
+                    " OR t.is_active IS DISTINCT FROM true"
+                    " OR t.retailer_sku IS DISTINCT FROM COALESCE(v.retailer_sku, t.retailer_sku)"
+                    " OR t.clean_name IS DISTINCT FROM COALESCE(v.clean_name, t.clean_name)"
+                    " OR t.brand_text IS DISTINCT FROM COALESCE(v.brand_text, t.brand_text)"
+                    " OR t.raw_category_path IS DISTINCT FROM COALESCE(v.raw_category_path, t.raw_category_path)"
+                    " OR t.product_url IS DISTINCT FROM COALESCE(v.product_url, t.product_url)"
+                    " OR t.image_url IS DISTINCT FROM COALESCE(v.image_url, t.image_url)"
+                    " OR t.barcode IS DISTINCT FROM COALESCE(v.barcode, t.barcode)"
+                    " OR t.raw_latest IS DISTINCT FROM COALESCE(NULLIF(v.raw_latest, '{}'::jsonb), t.raw_latest)"),
+                touch_sql="last_seen_at = now(), updated_at = now()")
 
         if new_idxs:
             # match_status defaults to 'unreviewed' at the DB level, but this
@@ -1211,18 +1282,9 @@ class Importer:
         if not needs_match:
             return
 
-        # Concurrency guard: serialize the *creation* of canonical products across
-        # any importers running in parallel. Taken here (before the lookups) and
-        # held to commit, so a second importer blocks until the first commits, then
-        # its own lookups below see that committed canonical and reuse it instead
-        # of creating a duplicate. No-op cost for a single importer; skipped
-        # entirely by re-imports (they never reach here). See CANON_CREATE_LOCK.
-        # lock_timeout bounds the wait: a contended waiter fails with a clean,
-        # retryable LockNotAvailable (connection intact) instead of blocking to the
-        # 2-min statement_timeout that cancels the statement and drops the conn.
-        self.cur.execute(f"SET LOCAL lock_timeout = '{CREATE_LOCK_TIMEOUT}'")
-        self.cur.execute("SELECT pg_advisory_xact_lock(%s)", (CANON_CREATE_LOCK,))
-
+        # (The advisory creation lock that used to be taken here is gone with
+        # parallelism — a single process cannot race itself, and it cost two
+        # round trips plus the lock hold on every batch that created anything.)
         barcode_idxs = [i for i in needs_match if batch[i]["barcode"]]
         nobarcode_idxs = [i for i in needs_match if not batch[i]["barcode"]]
 
@@ -1590,11 +1652,12 @@ class Importer:
                               variant_ids: list, promo_ids: list) -> None:
         n = len(batch)
         existing = {}
-        rows = self._all(
-            "SELECT retailer_product_id, id, current_price_cents, unit_price_cents, stock_status "
-            "FROM catalog.branch_product_current "
-            "WHERE branch_id = %s AND retailer_product_id = ANY(%s)",
-            (self.branch_id, rp_ids))
+        with self._stage("  bpc:select"):
+            rows = self._all(
+                "SELECT retailer_product_id, id, current_price_cents, unit_price_cents, stock_status "
+                "FROM catalog.branch_product_current "
+                "WHERE branch_id = %s AND retailer_product_id = ANY(%s)",
+                (self.branch_id, rp_ids))
         for rp_id, bpc_id, old_price, old_unit, old_stock in rows:
             existing[rp_id] = (bpc_id, old_price, old_unit, old_stock)
 
@@ -1655,6 +1718,7 @@ class Importer:
             # staging table carries price_changed/stock_changed for row-shape
             # parity with the tuple, though the SET only reads the *_updated_at
             # columns (already computed in Python above).
+          with self._stage("  bpc:copy_update"):
             self._copy_update(
                 "catalog.branch_product_current", "_stg_bpc",
                 "id uuid, canonical_product_id uuid, product_variant_id uuid, "
@@ -1679,9 +1743,26 @@ class Importer:
                 "scraped_at = v.scraped_at, "
                 "price_updated_at = COALESCE(v.price_updated_at, t.price_updated_at), "
                 "stock_updated_at = COALESCE(v.stock_updated_at, t.stock_updated_at), "
-                "last_seen_at = now(), updated_at = now()")
+                "last_seen_at = now(), updated_at = now()",
+                # All cheap scalar comparisons — no jsonb on this table.
+                changed_sql=(
+                    "t.current_price_cents IS DISTINCT FROM v.current_price_cents"
+                    " OR t.comparison_price_cents IS DISTINCT FROM v.comparison_price_cents"
+                    " OR t.unit_price_cents IS DISTINCT FROM v.unit_price_cents"
+                    " OR t.unit_label IS DISTINCT FROM v.unit_label"
+                    " OR t.stock_status IS DISTINCT FROM v.stock_status"
+                    " OR t.stock_quantity IS DISTINCT FROM v.stock_quantity"
+                    " OR t.is_on_special IS DISTINCT FROM v.is_on_special"
+                    " OR t.active_promotion_id IS DISTINCT FROM v.active_promotion_id"
+                    " OR t.canonical_product_id IS DISTINCT FROM COALESCE(v.canonical_product_id, t.canonical_product_id)"
+                    " OR t.product_variant_id IS DISTINCT FROM COALESCE(v.product_variant_id, t.product_variant_id)"),
+                # scraped_at still moves for every row we saw — that is the
+                # "we observed this product in this scrape" fact, and it is what
+                # keeps the branch from looking stale.
+                touch_sql="scraped_at = v.scraped_at, last_seen_at = now(), updated_at = now()")
 
         if insert_idxs:
+          with self._stage("  bpc:insert"):
             ins_rows = [(
                 self.branch_id, rp_ids[i], canonical_ids[i], variant_ids[i],
                 batch[i]["current_price_cents"], batch[i]["comparison_price_cents"],
@@ -1709,6 +1790,7 @@ class Importer:
                                       promo_ids[i], batch[i], None, None, None))
 
         if history_rows:
+          with self._stage("  price_history"):
             hist_ins = [(
                 bpc_id, self.branch_id, rp_id, cid, vid, old_price, rec["current_price_cents"],
                 old_unit, rec["unit_price_cents"], old_stock, rec["stock_status"], promo_id,
@@ -1745,12 +1827,13 @@ class Importer:
             return
         pairs = [(promo_ids[i], rp_ids[i]) for i in idxs]
         existing = {}
-        for pid, rpid, item_id in self._all(
+        with self._stage("  items:select"):
+          _existing_rows = self._all(
             "SELECT promotion_id, retailer_product_id, id FROM catalog.promotion_items "
             "WHERE (promotion_id, retailer_product_id) IN ("
             "  SELECT * FROM unnest(%s::uuid[], %s::uuid[]))",
-            ([p[0] for p in pairs], [p[1] for p in pairs])
-        ):
+            ([p[0] for p in pairs], [p[1] for p in pairs]))
+        for pid, rpid, item_id in _existing_rows:
             existing[(pid, rpid)] = item_id
 
         update_rows, insert_rows = [], []
@@ -1779,6 +1862,7 @@ class Importer:
                                      discount, mb_qty, mb_total, rec["unit_price_cents"], meta))
 
         if update_rows:
+          with self._stage("  items:update"):
             self._bulk_update(
                 "catalog.promotion_items", "id", "uuid",
                 ("branch_product_id", "original_price_cents", "special_price_cents",
@@ -1788,6 +1872,7 @@ class Importer:
                  "jsonb"),
                 update_rows)
         if insert_rows:
+          with self._stage("  items:insert"):
             self._bulk_insert(
                 "catalog.promotion_items",
                 ("promotion_id", "retailer_product_id", "branch_product_id", "original_price_cents",
@@ -2030,10 +2115,18 @@ def run_db(args, records: list[dict], rollback: bool) -> int:
         f"  reviews resolved  : {imp.reviews_resolved}",
         f"  review queued     : {imp.reviews_created}",
         f"  failed rows       : {imp.failed}",
+        f"  rows changed      : {imp.changed_rows} (full rewrite)",
+        f"  rows unchanged    : {imp.unchanged_rows} (freshness touch only)",
         f"  sku conflicts     : {imp.sku_conflicts} (retailer_sku left unwritten, "
         f"already owned by another row)",
         "======================",
     ]
+    if imp.stage_times:
+        tot = sum(imp.stage_times.values())
+        summary_lines.append(f"  --- stage profile (total {tot:.1f}s) ---")
+        for k, v in sorted(imp.stage_times.items(), key=lambda kv: -kv[1]):
+            summary_lines.append(f"    {k:24} {v:7.1f}s  {v / tot * 100:5.1f}%")
+        summary_lines.append("======================")
     for line in summary_lines:
         log.info(line)
     return 0
@@ -2076,14 +2169,6 @@ def parse_args(argv=None):
                         "Postgres/psycopg cap statements at 65,535 bind params, and the "
                         "widest bulk statement here (scraped_observations, 23 cols) hits "
                         "that ceiling at batch_size=2849.")
-    p.add_argument("--jobs", type=int, default=1,
-                   help="how many branches to import in PARALLEL (default 1 = "
-                        "sequential; only applies to --input-dir). Each branch runs in "
-                        "its own process (real parallelism for the JSON-serialization "
-                        "bottleneck) and its own DB connection. The importer is "
-                        "concurrency-safe: canonical-product creation is serialized so "
-                        "no duplicates, and same-retailer row deadlocks are retried. "
-                        "3-4 is a good, DB-friendly starting point.")
     p.add_argument("--reap-stale-only", action="store_true",
                    help="mark every abandoned 'running' import_run older than "
                         f"{STALE_RUN_AFTER} as 'stale', then exit without importing "
@@ -2111,18 +2196,6 @@ def _run_one_file(args, path: Path, branch_slug: Optional[str]) -> int:
     if args.dry_run:
         return run_dry(records)
     return run_db(args, records, rollback=args.rollback_test)
-
-
-def _worker_import(args, slug: str, path: Path) -> tuple:
-    """Process-pool entry point for one branch (must be module-level so it
-    pickles). Each worker gets its own copy of `args` (isolated per process), so
-    _run_one_file's in-place args mutation is process-local and safe."""
-    try:
-        rc = _run_one_file(args, path, slug)
-        return slug, rc
-    except Exception:
-        log.exception("branch %s FAILED (unhandled exception)", slug)
-        return slug, 1
 
 
 def _main_input_dir(args) -> int:
@@ -2174,39 +2247,21 @@ def _main_input_dir(args) -> int:
         except Exception:
             log.exception("stale-run sweep failed — continuing with the import anyway")
 
-    jobs = max(1, args.jobs)
-    log.info("=== full-chain import: %d branches found for retailer=%s (--jobs %d) ===",
-             len(branches), args.retailer, jobs)
+    log.info("=== full-chain import: %d branches found for retailer=%s ===",
+             len(branches), args.retailer)
     ordered = sorted(branches.items())
     ok, failed = [], []
 
-    if jobs == 1:
-        for i, (slug, path) in enumerate(ordered, 1):
-            log.info("--- branch %d/%d: %s (%s) ---", i, len(branches), slug, path.name)
-            try:
-                rc = _run_one_file(args, path, slug)
-                (ok if rc == 0 else failed).append(slug)
-                if rc != 0:
-                    log.error("branch %s FAILED (exit %d) — continuing to next branch", slug, rc)
-            except Exception:
-                log.exception("branch %s FAILED (unhandled exception) — continuing to next branch", slug)
-                failed.append(slug)
-    else:
-        # Parallel: one OS process per branch (true parallelism for the
-        # CPU-bound JSON serialization + overlapping DB I/O), each with its own
-        # connection. The importer's advisory-lock creation guard + deadlock
-        # retry make concurrent same-retailer branches safe. Failures don't
-        # abort the sweep — every branch is independently resumable.
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        with ProcessPoolExecutor(max_workers=jobs) as ex:
-            futs = {ex.submit(_worker_import, args, slug, path): slug
-                    for slug, path in ordered}
-            for done_n, fut in enumerate(as_completed(futs), 1):
-                slug, rc = fut.result()
-                (ok if rc == 0 else failed).append(slug)
-                log.info("--- branch %d/%d done: %s (exit %d) ---", done_n, len(branches), slug, rc)
-                if rc != 0:
-                    log.error("branch %s FAILED (exit %d)", slug, rc)
+    for i, (slug, path) in enumerate(ordered, 1):
+        log.info("--- branch %d/%d: %s (%s) ---", i, len(branches), slug, path.name)
+        try:
+            rc = _run_one_file(args, path, slug)
+            (ok if rc == 0 else failed).append(slug)
+            if rc != 0:
+                log.error("branch %s FAILED (exit %d) — continuing to next branch", slug, rc)
+        except Exception:
+            log.exception("branch %s FAILED (unhandled exception) — continuing to next branch", slug)
+            failed.append(slug)
 
     log.info("=== full-chain import done: %d/%d branches OK ===", len(ok), len(branches))
     if failed:
