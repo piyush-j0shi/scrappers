@@ -59,7 +59,8 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from supabase import create_client, Client
 # from report_client import post_branch_report  # disabled for server deploy (no monitor UI)
-from jsonl_export import write_jsonl, to_cents, clean_record
+from jsonl_export import write_jsonl, to_cents, clean_record, _slug
+from run_log import ScraperRunLog, category_record
 
 # ---------------------------------------------------------------------------
 # Paths & env
@@ -1293,6 +1294,7 @@ class WoolworthsClaudeScraper:
         await self._ensure_fresh_session()
 
         run_id = self._start_run()
+        _branch_t0 = time.time()
         stats = {"records_updated": 0, "records_failed": 0, "new_products": 0,
                  "price_changes": 0, "blocks_detected": 0, "retries": 0, "category_results": []}
 
@@ -1392,15 +1394,15 @@ class WoolworthsClaudeScraper:
                         else "empty result after retry"
                     )
                     stats["category_results"].append(
-                        {"name": _cat_name, "status": "failed", "products": 0, "reason": _reason}
+                        category_record(_cat_name, "failed", products, reason=_reason)
                     )
                 elif not products:
                     stats["category_results"].append(
-                        {"name": _cat_name, "status": "empty", "products": 0}
+                        category_record(_cat_name, "empty", products)
                     )
                 else:
                     stats["category_results"].append(
-                        {"name": _cat_name, "status": "success", "products": len(products)}
+                        category_record(_cat_name, "success", products)
                     )
                 all_products.extend(products)
             logger.info(f"TOTAL scraped: {len(all_products)} products")
@@ -1461,11 +1463,16 @@ class WoolworthsClaudeScraper:
             # )
         except Exception as e:
             logger.exception("run failed")
+            stats["status"] = "failed"
+            stats["duration"] = time.time() - _branch_t0
             self._end_run(run_id, "failed", stats, error=str(e))
             raise
         finally:
             await self._close_browser()
 
+        stats["status"] = status
+        stats["duration"] = time.time() - _branch_t0
+        stats["branch_name"] = self.branch_name
         return stats
 
     # ---- Supabase writes -------------------------------------------------
@@ -1984,6 +1991,11 @@ async def main_async() -> int:
     completed = 0
     total = len(branches)
     completed_lock = asyncio.Lock()
+    runlog = ScraperRunLog(
+        "woolworths",
+        mode="all-branches" if args.all_branches else "single-branch",
+        total_branches=total,
+    )
 
     async def run_one(b: dict) -> None:
         nonlocal completed
@@ -2009,9 +2021,24 @@ async def main_async() -> int:
                 overall["price_changes"] += stats["price_changes"]
                 overall["blocks"] += stats.get("blocks_detected", 0)
                 overall["retries"] += stats.get("retries", 0)
+                runlog.add_branch(
+                    branch_name=stats.get("branch_name") or scraper.branch_name,
+                    branch_slug=_slug(stats.get("branch_name") or scraper.branch_name),
+                    status=stats.get("status", "success"),
+                    duration_seconds=stats.get("duration", 0.0),
+                    categories=stats.get("category_results", []),
+                )
             except Exception as e:
                 logger.error(f"branch {b.get('name') or b.get('id')} failed: {e}")
                 overall["failed"] += 1
+                runlog.add_branch(
+                    branch_name=scraper.branch_name,
+                    branch_slug=_slug(scraper.branch_name),
+                    status="failed",
+                    duration_seconds=0.0,
+                    categories=[],
+                    error=str(e)[:500],
+                )
             async with completed_lock:
                 completed += 1
                 logger.info(f"=== progress: {completed}/{total} branches done ({(completed/total*100):.1f}%) ===")
@@ -2025,6 +2052,9 @@ async def main_async() -> int:
         f"failed={overall['failed']}  blocks={overall['blocks']}  retries={overall['retries']}  "
         f"elapsed={dt:.1f}s"
     )
+    log_path = runlog.finish(overall)
+    if log_path:
+        logger.info(f"[runlog] scraper run log → {log_path}")
     return 0
 
 

@@ -74,6 +74,19 @@ except Exception:  # pragma: no cover - dotenv is optional at runtime
 
 log = logging.getLogger("import_products")
 
+# Shared run-log writer lives next to the scrapers (one logs/ dir + index for
+# both scraper and importer runs). It has no heavy deps, so importing it here is
+# cheap; if the layout ever changes, run-logging just no-ops rather than breaking
+# the import.
+_run_log = None
+try:
+    _scrapers_dir = Path(__file__).resolve().parent / "claude scrapers"
+    if _scrapers_dir.is_dir() and str(_scrapers_dir) not in sys.path:
+        sys.path.insert(0, str(_scrapers_dir))
+    import run_log as _run_log  # noqa: E402
+except Exception:  # pragma: no cover - run logging is best-effort
+    _run_log = None
+
 # File logging — one file PER RUN (not shared across branches/retailers), named
 # logs/import_<input export filename stem>_<run timestamp>.log, set up in main()
 # once args are parsed so the file name can include the branch being imported.
@@ -152,6 +165,37 @@ IDENTIFIER_TOUCH_AFTER = "12 hours"
 # IMPORTER_TOUCH_UNCHANGED=0 to skip them and rely on branch-level freshness
 # (catalog.branches.last_scraped_at + the full-branch out-of-stock sweep).
 TOUCH_UNCHANGED = os.environ.get("IMPORTER_TOUCH_UNCHANGED", "1") != "0"
+
+# Connection keepalive. WITHOUT these, a silently-dropped Supabase pooler
+# connection (SSL closed by the far end with no FIN reaching us) leaves psycopg
+# blocked on a socket read forever: an import once hung 17.5 HOURS on one branch
+# waiting for a reply that was never coming, before TCP finally gave up. With
+# them the kernel probes a quiet socket and surfaces the dead connection in
+# ~connect_timeout + (idle + interval*count) seconds — here ~30s worst case —
+# which the batch retry loop then reconnects and continues from.
+#   connect_timeout   : cap the initial TCP+auth handshake
+#   keepalives_idle   : start probing after 30s of silence
+#   keepalives_interval: 10s between probes
+#   keepalives_count  : 3 unanswered probes -> declare the socket dead (~30s)
+CONNECT_KWARGS = dict(
+    connect_timeout=10,
+    keepalives=1,
+    keepalives_idle=30,
+    keepalives_interval=10,
+    keepalives_count=3,
+)
+
+
+def db_connect(dsn: str):
+    """Single place every importer connection is opened. Applies the keepalive
+    settings and the pooler-specific prepared-statement disable, so no call site
+    can forget either. Returns a NON-autocommit connection."""
+    import psycopg
+    conn = psycopg.connect(dsn, **CONNECT_KWARGS)
+    conn.autocommit = False
+    if ":6543" in dsn:  # Supabase transaction pooler can't do prepared statements
+        conn.prepare_threshold = None
+    return conn
 
 # --retailer slug (DB, catalog.retailers.slug) -> export filename prefix
 # ({scraper_name} passed to jsonl_export.write_jsonl — confirmed straight from
@@ -515,10 +559,15 @@ class Importer:
         self.variants_created = 0
         self.identifiers_created = 0
         self.identifiers_touched = 0
+        # promotions flipped is_active=false by sweep_unseen because no product in
+        # the branch still points at them this run — i.e. the promo has ENDED.
+        self.promos_deactivated = 0
         self.stage_times: dict[str, float] = {}
         # split of the re-import write path (see _copy_update)
         self.changed_rows = 0
         self.unchanged_rows = 0
+        self.rows_written: dict[str, int] = {}   # table -> rows actually written
+        self.rows_skipped: dict[str, int] = {}   # table -> rows sent but unchanged
         # retailer_sku values this run declined to write because another row already
         # owned them (see sku_for). Non-fatal, but a high count means the export has
         # a lot of sku reuse and is worth reporting rather than silently swallowing.
@@ -556,28 +605,39 @@ class Importer:
                        "identifiers_touched", "sku_conflicts",
                        "changed_rows", "unchanged_rows")
 
+    # Per-table row-write tallies. Kept as dicts (not plain ints) so the log can
+    # say WHICH table absorbed the writes — "342 rows written" is only
+    # actionable if you know whether it was retailer_products or the price rows.
+    _BATCH_COUNTER_DICTS = ("rows_written", "rows_skipped")
+
     def _counter_snapshot(self) -> dict:
-        return {k: getattr(self, k) for k in self._BATCH_COUNTERS}
+        snap = {k: getattr(self, k) for k in self._BATCH_COUNTERS}
+        # dicts must be COPIED — a reference would be mutated by the very batch
+        # we are trying to be able to roll back.
+        snap.update({k: dict(getattr(self, k)) for k in self._BATCH_COUNTER_DICTS})
+        return snap
 
     def _restore_counters(self, snap: dict) -> None:
         for k, v in snap.items():
-            setattr(self, k, v)
+            setattr(self, k, dict(v) if isinstance(v, dict) else v)
+
+    def _write_tally(self, table: str, written: int, offered: int) -> None:
+        """Record that `offered` rows were sent for `table` and `written` of them
+        actually needed writing. The gap is the work the change-detection saved."""
+        short = table.split(".")[-1]
+        self.rows_written[short] = self.rows_written.get(short, 0) + written
+        self.rows_skipped[short] = self.rows_skipped.get(short, 0) + (offered - written)
 
     def reconnect(self, dsn: str) -> None:
         """Rebuild a dead connection (e.g. the pooler dropped us after a timeout).
         Run-level caches hold only committed ids, so they stay valid across a
         reconnect — only the live conn/cursor need replacing."""
-        import psycopg
         try:
             self.conn.close()
         except Exception:
             pass
-        conn = psycopg.connect(dsn)
-        conn.autocommit = False
-        if ":6543" in dsn:
-            conn.prepare_threshold = None
-        self.conn = conn
-        self.cur = conn.cursor()
+        self.conn = db_connect(dsn)
+        self.cur = self.conn.cursor()
 
     # ---- bulk SQL helpers --------------------------------------------------- #
     @staticmethod
@@ -705,8 +765,13 @@ class Importer:
             where += f" AND ({changed_sql})"
         self.cur.execute(
             f"UPDATE {target} AS t SET {set_sql} FROM {temp} AS v WHERE {where}")
-        self.changed_rows += self.cur.rowcount
-        return self.cur.rowcount
+        written = self.cur.rowcount
+        self.changed_rows += written
+        # `offered` is what we sent, `written` is what actually needed writing —
+        # the difference is the point of the whole change-detection path, so it
+        # is tallied per table rather than inferred from a batch-size figure.
+        self._write_tally(target, written, len(rows))
+        return written
 
     # ---- resolution (small, one-off — not batch-sensitive) ----------------- #
     def resolve(self, *, external_store_id, branch_slug, branch_code, branch_name):
@@ -1895,13 +1960,20 @@ class Importer:
             "AND NOT (retailer_product_id = ANY(%s))",
             (self.branch_id, seen))
         swept = self.cur.rowcount
+        # Promo-ended: a product's own promo fields (is_on_special/active_promotion_id)
+        # are already cleared to NULL on re-import when the latest scrape carries no
+        # promo for it. That orphans the promotion row (nothing points at it), so we
+        # soft-deactivate it here. The subquery is filtered to NON-NULL ids, so the
+        # NOT IN can't be poisoned by a NULL (which would silently match nothing).
         self.cur.execute(
             "UPDATE catalog.promotions SET is_active = false, updated_at = now() "
             "WHERE branch_id = %s AND is_active = true AND id NOT IN ("
             "  SELECT active_promotion_id FROM catalog.branch_product_current "
             "  WHERE branch_id = %s AND active_promotion_id IS NOT NULL)",
             (self.branch_id, self.branch_id))
-        log.info("full-branch sweep: %d products marked out_of_stock", swept)
+        self.promos_deactivated = self.cur.rowcount
+        log.info("full-branch sweep: %d products marked out_of_stock, "
+                 "%d ended promotions deactivated", swept, self.promos_deactivated)
         self.conn.commit()
 
 
@@ -1969,12 +2041,11 @@ def reap_all_stale_runs(older_than: str = STALE_RUN_AFTER) -> int:
     Marks them 'stale' (ingest.import_runs.status has no CHECK constraint, so
     that is a legal value) rather than deleting anything.
     """
-    import psycopg
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
         log.error("DATABASE_URL is not set — cannot reap stale runs.")
         return -1
-    with psycopg.connect(dsn) as conn:
+    with db_connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE ingest.import_runs SET status = 'stale', finished_at = now(), "
@@ -1993,8 +2064,106 @@ def reap_all_stale_runs(older_than: str = STALE_RUN_AFTER) -> int:
     return n
 
 
+def _importer_branch_stats(imp) -> dict:
+    """Snapshot the per-branch importer counters for the JSON run log."""
+    return {
+        "products_inserted": imp.inserted,
+        "products_seen": imp.updated,
+        "new_products": imp.new_products,
+        "price_changes": imp.price_changes,
+        "matched": imp.matched,
+        "canonicals_created": imp.canonicals_created,
+        "variants_created": imp.variants_created,
+        "barcodes_linked": imp.identifiers_created,
+        "barcodes_refreshed": imp.identifiers_touched,
+        "promos_deactivated": imp.promos_deactivated,
+        "failed_rows": imp.failed,
+        "sku_conflicts": imp.sku_conflicts,
+        "rows_written": dict(imp.rows_written),
+        "rows_skipped": dict(imp.rows_skipped),
+        "stage_seconds": {k: round(v, 1) for k, v in imp.stage_times.items()},
+    }
+
+
+class ImporterRunLog:
+    """Accumulates per-branch importer stats for one command (single branch or a
+    full --input-dir chain) and writes ONE JSON file + index entry at the end.
+    Mirrors the scraper's ScraperRunLog schema (kind='importer'). Best-effort:
+    when the shared run_log module isn't importable, finish() just no-ops."""
+
+    def __init__(self, retailer: str, mode: str, total_branches: int = 0):
+        self.retailer = retailer
+        self.mode = mode
+        self.total_branches = total_branches
+        self._t0 = time.time()
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.branches: list[dict] = []
+        # Fixed filename for the whole run — rewritten after each branch so an
+        # interrupted or in-flight chain import still has a JSON on disk.
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.filename = f"importer_{self.retailer}_{stamp}.json"
+
+    def _doc(self, status: str) -> dict:
+        ok = sum(1 for b in self.branches if b["status"] == "success")
+        failed = sum(1 for b in self.branches if b["status"] != "success")
+        totals: dict[str, float] = {}
+        for b in self.branches:
+            for k, v in (b.get("stats") or {}).items():
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, (int, float)):
+                    totals[k] = totals.get(k, 0) + v
+        return {
+            "kind": "importer",
+            "chain": self.retailer,
+            "retailer": self.retailer,
+            "mode": self.mode,
+            "status": status,  # "running" until the whole run completes, then "complete"
+            "started_at": self.started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "duration_seconds": round(time.time() - self._t0, 1),
+            "branches_total": self.total_branches or len(self.branches),
+            "branches_done": len(self.branches),
+            "branches_ok": ok,
+            "branches_failed": failed,
+            "totals": totals,
+            "branches": self.branches,
+        }
+
+    def _flush(self, status: str):
+        if _run_log is None:
+            return None
+        return _run_log.write_run(self._doc(status), self.filename)
+
+    def add_branch(self, *, branch_slug, status, duration_seconds, stats, error=None):
+        self.branches.append({
+            "branch_slug": branch_slug,
+            "status": status,
+            "duration_seconds": round(float(duration_seconds), 1),
+            "stats": stats,
+            "error": error,
+        })
+        self._flush("running")  # flush after every branch for live progress
+
+    def finish(self):
+        return self._flush("complete")
+
+
 def run_db(args, records: list[dict], rollback: bool) -> int:
     import psycopg
+    _t0 = time.time()
+
+    def _record_branch(status, error=None, have_imp=True):
+        rl = getattr(args, "_runlog", None)
+        if rl is None:
+            return
+        slug = (args.branch_slug
+                or (args.input.stem if getattr(args, "input", None) else None)
+                or args.retailer)
+        stats = _importer_branch_stats(imp) if have_imp else {}
+        rl.add_branch(branch_slug=slug, status=status,
+                      duration_seconds=time.time() - _t0, stats=stats, error=error)
+
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
         log.error("DATABASE_URL is not set (Supabase Postgres pooler). "
@@ -2018,12 +2187,12 @@ def run_db(args, records: list[dict], rollback: bool) -> int:
     if args.full_branch and frac > MAX_FAILED_FRACTION:
         log.error("ABORT full-branch: %.2f%% rows failed validation (> %.1f%% threshold)",
                   frac * 100, MAX_FAILED_FRACTION * 100)
+        _record_branch("failed",
+                       error=f"aborted: {frac*100:.1f}% rows failed validation",
+                       have_imp=False)
         return 3
 
-    conn = psycopg.connect(dsn)
-    conn.autocommit = False
-    if ":6543" in dsn:
-        conn.prepare_threshold = None
+    conn = db_connect(dsn)
     imp = Importer(conn, args.retailer, args.source_system)
     batch_size = args.batch_size
     total = len(deduped)
@@ -2035,21 +2204,21 @@ def run_db(args, records: list[dict], rollback: bool) -> int:
 
         done = 0
         label = "rolled back" if rollback else "committed"
-        # Transient errors under concurrency (connection stays alive, tx aborted):
-        # deadlock on shared rows, lock_timeout on the creation lock, a
-        # statement_timeout cancel, or a unique-violation race — two parallel
-        # workers (different branches) both SELECT-miss the same brand-new shared
-        # row (a retailer_product keyed by (retailer_id, source_product_id), or a
-        # canonical/variant/barcode) and both INSERT; the loser gets 23505. On
-        # retry its SELECT finds the winner's now-committed row and takes the
-        # UPDATE path, so there's no INSERT to collide. process_batch aborts+resets
-        # atomically, so the batch is always safe to re-run from a clean slate.
+        # Transient errors that leave the connection alive but abort the tx.
+        # With parallelism removed these are infrastructure events, not
+        # self-contention: a statement_timeout cancel, or the Supabase pooler
+        # dropping us mid-batch. The deadlock/lock/unique entries stay as cheap
+        # insurance in case another writer (a second importer run, the app)
+        # touches the same rows. process_batch aborts and resets its side effects
+        # atomically, so a batch is always safe to re-run from a clean slate.
         TRANSIENT = (psycopg.errors.DeadlockDetected,
                      psycopg.errors.LockNotAvailable,
                      psycopg.errors.QueryCanceled,
                      psycopg.errors.UniqueViolation)
         for batch in chunked(deduped, batch_size):
             before = (imp.inserted, imp.updated, imp.new_products, imp.matched)
+            written_before = dict(imp.rows_written)
+            skipped_before = dict(imp.rows_skipped)
             for attempt in range(1, MAX_BATCH_RETRIES + 1):
                 try:
                     imp.process_batch(batch, commit=not rollback)
@@ -2074,9 +2243,19 @@ def run_db(args, records: list[dict], rollback: bool) -> int:
                     imp.reconnect(dsn)
                     time.sleep(min(10.0, 0.5 * attempt) + random.uniform(0, 0.5))
             done += len(batch)
-            log.info("[%d/%d] batch %s: +%d inserted, +%d updated, +%d new-listing, +%d matched",
-                      done, total, label, imp.inserted - before[0], imp.updated - before[1],
-                      imp.new_products - before[2], imp.matched - before[3])
+            # Report what was actually WRITTEN, not how many records were looked
+            # at. The old line printed the batch size as "updated" every time
+            # (it counted records processed), which on a re-import is always the
+            # full batch and says nothing about whether anything really changed.
+            wrote = {t: n - written_before.get(t, 0) for t, n in imp.rows_written.items()
+                     if n - written_before.get(t, 0) > 0}
+            skipped = sum(n - skipped_before.get(t, 0) for t, n in imp.rows_skipped.items())
+            detail = ", ".join(f"{t} {n}" for t, n in sorted(wrote.items())) or "none"
+            log.info("[%d/%d] batch %s: %d rows updated (%s), %d unchanged/skipped, "
+                     "%d new rows inserted, +%d new products, +%d newly matched",
+                     done, total, label, sum(wrote.values()), detail, skipped,
+                     imp.inserted - before[0],
+                     imp.new_products - before[2], imp.matched - before[3])
 
         if args.full_branch and args.limit is None and not rollback:
             imp.sweep_unseen()
@@ -2097,6 +2276,7 @@ def run_db(args, records: list[dict], rollback: bool) -> int:
                 conn.commit()
         except Exception:
             conn.rollback()
+        _record_branch("failed", error=str(exc)[:500])
         return 1
     finally:
         conn.close()
@@ -2104,7 +2284,9 @@ def run_db(args, records: list[dict], rollback: bool) -> int:
     summary_lines = [
         "=== IMPORT SUMMARY ===",
         f"  mode              : {run_type}{' (rolled back)' if rollback else ''}",
-        f"  branch products   : inserted {imp.inserted}, updated {imp.updated}",
+        # NB: `updated` counts records PROCESSED that matched an existing row —
+        # not rows written. See the per-table breakdown below for real writes.
+        f"  branch products   : inserted {imp.inserted}, seen/processed {imp.updated}",
         f"  new products      : {imp.new_products}",
         f"  price changes     : {imp.price_changes}",
         f"  matched           : {imp.matched}",
@@ -2112,11 +2294,15 @@ def run_db(args, records: list[dict], rollback: bool) -> int:
         f"  variants created  : {imp.variants_created}",
         f"  barcodes linked   : {imp.identifiers_created}",
         f"  barcodes refreshed: {imp.identifiers_touched} (last_seen_at bumped)",
+        f"  promos deactivated: {imp.promos_deactivated} (ended — no product still on them)",
         f"  reviews resolved  : {imp.reviews_resolved}",
         f"  review queued     : {imp.reviews_created}",
         f"  failed rows       : {imp.failed}",
-        f"  rows changed      : {imp.changed_rows} (full rewrite)",
-        f"  rows unchanged    : {imp.unchanged_rows} (freshness touch only)",
+        "  --- rows actually written (per table) ---",
+        *[f"    {t:24} {imp.rows_written.get(t, 0):7d} updated, "
+          f"{imp.rows_skipped.get(t, 0):7d} unchanged"
+          for t in sorted(set(imp.rows_written) | set(imp.rows_skipped))],
+        f"  freshness-only touches: {imp.unchanged_rows}",
         f"  sku conflicts     : {imp.sku_conflicts} (retailer_sku left unwritten, "
         f"already owned by another row)",
         "======================",
@@ -2129,6 +2315,7 @@ def run_db(args, records: list[dict], rollback: bool) -> int:
         summary_lines.append("======================")
     for line in summary_lines:
         log.info(line)
+    _record_branch("success")
     return 0
 
 
@@ -2251,6 +2438,7 @@ def _main_input_dir(args) -> int:
              len(branches), args.retailer)
     ordered = sorted(branches.items())
     ok, failed = [], []
+    args._runlog = None if args.dry_run else ImporterRunLog(args.retailer, "all-branches", len(branches))
 
     for i, (slug, path) in enumerate(ordered, 1):
         log.info("--- branch %d/%d: %s (%s) ---", i, len(branches), slug, path.name)
@@ -2267,6 +2455,10 @@ def _main_input_dir(args) -> int:
     if failed:
         log.error("FAILED branches (%d): %s", len(failed), ", ".join(failed))
         log.error("re-run just those with --input <file> --branch-slug <slug> --full-branch")
+    if args._runlog is not None:
+        log_path = args._runlog.finish()
+        if log_path:
+            log.info("[runlog] importer run log → %s", log_path)
     return 0 if not failed else 1
 
 
@@ -2299,7 +2491,13 @@ def main(argv=None) -> int:
             log.error("a branch selector is required "
                       "(--external-store-id / --branch-slug / --branch-code / --branch-name)")
             return 2
-    return _run_one_file(args, args.input, None)
+    args._runlog = None if args.dry_run else ImporterRunLog(args.retailer, "single-branch", 1)
+    rc = _run_one_file(args, args.input, None)
+    if args._runlog is not None:
+        log_path = args._runlog.finish()
+        if log_path:
+            log.info("[runlog] importer run log → %s", log_path)
+    return rc
 
 
 if __name__ == "__main__":

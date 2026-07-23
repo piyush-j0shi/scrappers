@@ -47,7 +47,8 @@ from dotenv import load_dotenv
 from patchright.async_api import async_playwright, Browser, BrowserContext, Page
 from supabase import create_client, Client
 # from report_client import post_branch_report  # disabled for server deploy (no monitor UI)
-from jsonl_export import write_jsonl, to_cents, clean_record
+from jsonl_export import write_jsonl, to_cents, clean_record, _slug
+from run_log import ScraperRunLog, category_record
 
 # ---------------------------------------------------------------------------
 # Paths & env
@@ -2143,6 +2144,7 @@ class FoodstuffsScraper:
         )
 
         run_id = self._start_run()
+        _branch_t0 = time.time()
         stats = {"records_updated": 0, "records_failed": 0, "new_products": 0,
                  "price_changes": 0, "barcodes_from_cache": 0, "barcodes_fetched": 0,
                  "blocks": 0, "categories_failed": 0, "category_results": []}
@@ -2277,15 +2279,15 @@ class FoodstuffsScraper:
                         else "empty result after retries"
                     )
                     stats["category_results"].append(
-                        {"name": _cat_name, "status": "failed", "products": 0, "reason": _reason}
+                        category_record(_cat_name, "failed", products, reason=_reason)
                     )
                 elif not products:
                     stats["category_results"].append(
-                        {"name": _cat_name, "status": "empty", "products": 0}
+                        category_record(_cat_name, "empty", products)
                     )
                 else:
                     stats["category_results"].append(
-                        {"name": _cat_name, "status": "success", "products": len(products)}
+                        category_record(_cat_name, "success", products)
                     )
                 all_products.extend(products)
                 if did_paginate:
@@ -2320,6 +2322,8 @@ class FoodstuffsScraper:
                 else "success"
             )
             await loop.run_in_executor(None, lambda: self._end_run(run_id, status, stats))
+            stats["status"] = status
+            stats["branch_name"] = self.branch_name
             specials = sum(1 for p in all_products if p.special_price is not None)
             out_of_stock = sum(1 for p in all_products if not p.in_stock)
 
@@ -2348,6 +2352,8 @@ class FoodstuffsScraper:
             # ))
         except Exception as e:
             logger.exception("run failed")
+            stats["status"] = "failed"
+            stats["duration"] = time.time() - _branch_t0
             await loop.run_in_executor(None, lambda: self._end_run(run_id, "failed", stats, error=str(e)))
             raise
         finally:
@@ -2369,6 +2375,7 @@ class FoodstuffsScraper:
                         pass
             else:
                 await self._close_browser()
+        stats["duration"] = time.time() - _branch_t0
         return stats
 
     # ---- Supabase writes (mirrors woolworths_claude.py) -----------------
@@ -2966,6 +2973,11 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
     overall = {"branches": 0, "updated": 0, "new": 0, "failed": 0, "price_changes": 0,
                "cache_hits": 0, "fetched": 0, "blocks": 0}
     t0 = time.time()
+    runlog = ScraperRunLog(
+        args.chain,
+        mode="all-branches" if args.all_branches else "single-branch",
+        total_branches=len(branches),
+    )
 
     adaptive = AdaptiveSemaphore(max(1, args.concurrency), min_level=1)
     # Scale block threshold proportionally with concurrency (base rate: 5 blocks per worker)
@@ -3041,6 +3053,13 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
                 # Only checkpoint if branch had no empty categories — records_failed includes
                 # normal unresolvable products so don't use it as a disqualifier
                 branch_clean = stats.get("categories_failed", -1) == 0
+                runlog.add_branch(
+                    branch_name=stats.get("branch_name") or scraper.branch_name,
+                    branch_slug=_slug(stats.get("branch_name") or scraper.branch_name),
+                    status=stats.get("status", "success"),
+                    duration_seconds=stats.get("duration", 0.0),
+                    categories=stats.get("category_results", []),
+                )
                 logger.info(f"[checkpoint] branch={b.get('name')} id={b.get('id')} categories_failed={stats.get('categories_failed', 'MISSING')} branch_clean={branch_clean}")
                 if b.get("id") and branch_clean:
                     completed_ids.add(b["id"])
@@ -3053,6 +3072,14 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
             except Exception as e:
                 logger.error(f"branch {b.get('name') or b.get('id')} failed: {e}")
                 overall["failed"] += 1
+                runlog.add_branch(
+                    branch_name=scraper.branch_name,
+                    branch_slug=_slug(scraper.branch_name),
+                    status="failed",
+                    duration_seconds=0.0,
+                    categories=[],
+                    error=str(e)[:500],
+                )
             async with completed_lock:
                 completed += 1
                 logger.info(
@@ -3128,6 +3155,9 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
         f"barcodes(cache/fetched)={overall['cache_hits']}/{overall['fetched']}  "
         f"elapsed={dt:.1f}s"
     )
+    log_path = runlog.finish(overall)
+    if log_path:
+        logger.info(f"[runlog] scraper run log → {log_path}")
     return 0
 
 
