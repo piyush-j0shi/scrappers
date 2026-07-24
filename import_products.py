@@ -159,12 +159,26 @@ STALE_RUN_AFTER = "2 hours"
 # per run (millions of pointless row versions, WAL, and vacuum debt) to record
 # information that only needs to be accurate to within a scrape cycle.
 IDENTIFIER_TOUCH_AFTER = "12 hours"
-# Per-row freshness columns (retailer_products.last_seen_at,
-# branch_product_current.scraped_at/last_seen_at) cost a heap rewrite of EVERY
-# row on EVERY import even when nothing about the product changed. Set
-# IMPORTER_TOUCH_UNCHANGED=0 to skip them and rely on branch-level freshness
-# (catalog.branches.last_scraped_at + the full-branch out-of-stock sweep).
-TOUCH_UNCHANGED = os.environ.get("IMPORTER_TOUCH_UNCHANGED", "1") != "0"
+# Freshness semantics (these three must not be conflated):
+#   last_seen_at      the product was SEEN in this scrape.
+#   updated_at        the stored product data actually CHANGED.
+#   price_updated_at  the price specifically changed.
+# updated_at and price_updated_at are written ONLY on the real-change path
+# (set_sql), i.e. only for rows that were going to be rewritten anyway — they
+# cost nothing extra and are always correct.
+#
+# last_seen_at for UNCHANGED rows is a different story: stamping it means a heap
+# rewrite of every observed row on every import. Measured on one branch that is
+# 79 -> 11,838 writes on retailer_products, and retailer_products is
+# retailer-wide, so a 148-branch chain rewrites the same row up to 148 times.
+# It is OFF by default (set IMPORTER_TOUCH_UNCHANGED=1 to enable).
+#
+# Turning it off does NOT weaken out-of-stock detection: sweep_unseen() decides
+# what disappeared using the in-memory seen-set from the current run
+# (_seen_retailer_product_ids), never last_seen_at timestamps. Products that
+# vanish are marked out_of_stock there, and their last_seen_at correctly stays
+# old because they genuinely were not seen.
+TOUCH_UNCHANGED = os.environ.get("IMPORTER_TOUCH_UNCHANGED", "0") != "0"
 
 # Connection keepalive. WITHOUT these, a silently-dropped Supabase pooler
 # connection (SSL closed by the far end with no FIN reaching us) leaves psycopg
@@ -572,6 +586,13 @@ class Importer:
         # owned them (see sku_for). Non-fatal, but a high count means the export has
         # a lot of sku reuse and is worth reporting rather than silently swallowing.
         self.sku_conflicts = 0
+        # Same product, a barcode we hadn't seen before. Name matched, so the new
+        # barcode is kept as an extra (non-primary) identifier rather than
+        # overwriting the one already stored.
+        self.barcodes_aliased = 0
+        # Same sku/id but a DIFFERENT barcode AND a different name — never
+        # overwritten, queued for a human instead.
+        self.barcode_conflicts = 0
         self._seen_retailer_product_ids: set[str] = set()
 
     # ---- stage profiling ---------------------------------------------------- #
@@ -603,6 +624,7 @@ class Importer:
                        "reviews_created", "reviews_resolved", "matched",
                        "canonicals_created", "variants_created", "identifiers_created",
                        "identifiers_touched", "sku_conflicts",
+                       "barcodes_aliased", "barcode_conflicts",
                        "changed_rows", "unchanged_rows")
 
     # Per-table row-write tallies. Kept as dicts (not plain ints) so the log can
@@ -756,6 +778,8 @@ class Importer:
                 cp.write_row(row)
         where = f"t.{key} = v.{key}"
         if changed_sql and not TOUCH_UNCHANGED:
+            # Default: unchanged rows are not written at all. Out-of-stock
+            # detection does not depend on this (see the note by TOUCH_UNCHANGED).
             where += f" AND ({changed_sql})"
         elif changed_sql and touch_sql:
             self.cur.execute(
@@ -1055,17 +1079,23 @@ class Importer:
         # sku in the batch is looked up here — not just the spid-less ones, as
         # before — and a sku already spoken for is dropped rather than fought over.
         sku_owner: dict[str, tuple] = {}
+        # rp_id -> (stored barcode, stored clean_name). Needed to decide what to do
+        # when a record resolves to a product we already have but carries a
+        # different barcode: same name => extra barcode, different name => review.
+        rp_info: dict[str, tuple] = {}
         if spids or all_skus:
             rows = self._all(
-                "SELECT id, canonical_product_id, product_variant_id, source_product_id, retailer_sku "
+                "SELECT id, canonical_product_id, product_variant_id, source_product_id, "
+                "retailer_sku, barcode, clean_name "
                 "FROM catalog.retailer_products WHERE retailer_id = %s "
                 "AND (source_product_id = ANY(%s) OR retailer_sku = ANY(%s))",
                 (self.retailer_id, spids or [], all_skus or []))
-            for rp_id, cid, vid, spid, sku in rows:
+            for rp_id, cid, vid, spid, sku, old_bc, old_name in rows:
                 key = ("spid", spid) if spid else ("sku", sku)
                 existing[key] = (rp_id, cid, vid)
                 if sku:
                     sku_owner[sku] = (rp_id, cid, vid)
+                rp_info[rp_id] = (old_bc, old_name)
 
         def ident(rec):
             return ("spid", rec["source_product_id"]) if rec["source_product_id"] \
@@ -1107,6 +1137,8 @@ class Importer:
 
         update_rows = []
         new_idxs = []
+        alias_rows = []      # (cid, vid, barcode, source) — extra barcodes to keep
+        conflict_rows = []   # (rp_id, cid, vid, rec, old_barcode, old_name)
         for i, rec in enumerate(batch):
             hit = existing.get(ident(rec))
             if hit is None and not rec["source_product_id"] and rec["retailer_sku"]:
@@ -1117,6 +1149,20 @@ class Importer:
                 hit = sku_owner.get(rec["retailer_sku"])
             if hit:
                 rp_ids[i], canonical_ids[i], variant_ids[i] = hit
+                old_bc, old_name = rp_info.get(rp_ids[i], (None, None))
+                new_bc = rec["barcode"]
+                if new_bc and old_bc and new_bc != old_bc:
+                    # Same product identity (spid/sku) but a barcode we don't hold.
+                    # The name decides: matching name = the retailer gave us another
+                    # barcode for the same item, so keep BOTH. Different name means
+                    # the identity is suspect and a human has to look.
+                    if _same_product_name(old_name, rec["clean_name"] or rec["raw_name"]):
+                        alias_rows.append((canonical_ids[i], variant_ids[i], new_bc,
+                                           self.source_system))
+                        self.barcodes_aliased += 1
+                    else:
+                        conflict_rows.append((rp_ids[i], canonical_ids[i], variant_ids[i],
+                                              rec, old_bc, old_name))
                 update_rows.append((
                     rp_ids[i], sku_for(i, rec, rp_ids[i]), rec["raw_name"], rec["clean_name"],
                     rec["brand"], rec["category_path"], rec["product_url"], rec["image_url"],
@@ -1146,7 +1192,11 @@ class Importer:
                 "raw_category_path = COALESCE(v.raw_category_path, t.raw_category_path), "
                 "product_url = COALESCE(v.product_url, t.product_url), "
                 "image_url = COALESCE(v.image_url, t.image_url), "
-                "barcode = COALESCE(v.barcode, t.barcode), "
+                # NEVER overwrite a barcode we already hold: t.barcode wins, and a
+                # new value only fills an empty column. A differing barcode is
+                # handled out-of-band (aliased onto the product, or queued for
+                # review when the name doesn't match) — see _classify_barcode.
+                "barcode = COALESCE(t.barcode, v.barcode), "
                 "raw_latest = COALESCE(NULLIF(v.raw_latest, '{}'::jsonb), t.raw_latest), "
                 "last_seen_at = now(), is_active = true, updated_at = now()",
                 # Cheap scalars first — OR short-circuits left to right, so a row
@@ -1161,9 +1211,17 @@ class Importer:
                     " OR t.raw_category_path IS DISTINCT FROM COALESCE(v.raw_category_path, t.raw_category_path)"
                     " OR t.product_url IS DISTINCT FROM COALESCE(v.product_url, t.product_url)"
                     " OR t.image_url IS DISTINCT FROM COALESCE(v.image_url, t.image_url)"
-                    " OR t.barcode IS DISTINCT FROM COALESCE(v.barcode, t.barcode)"
+                    # only true when t.barcode IS NULL and v.barcode is not, i.e.
+                    # we are filling a blank rather than replacing anything
+                    " OR t.barcode IS DISTINCT FROM COALESCE(t.barcode, v.barcode)"
                     " OR t.raw_latest IS DISTINCT FROM COALESCE(NULLIF(v.raw_latest, '{}'::jsonb), t.raw_latest)"),
-                touch_sql="last_seen_at = now(), updated_at = now()")
+                # freshness only — updated_at means "the data changed", so it is
+                # deliberately NOT written here (see the semantics note up top).
+                touch_sql="last_seen_at = now()")
+
+        # Both are no-ops when nothing conflicted, which is the overwhelming case.
+        self._save_extra_barcodes(alias_rows)
+        self._queue_barcode_conflicts(conflict_rows)
 
         if new_idxs:
             # match_status defaults to 'unreviewed' at the DB level, but this
@@ -1299,6 +1357,63 @@ class Importer:
             if b:
                 out[i] = self._brand_cache.get(db_normalized_name(b))
         return out
+
+    # ---- barcode preservation (never overwrite) ----------------------------- #
+    def _save_extra_barcodes(self, alias_rows: list) -> None:
+        """Keep an additional barcode for a product we already know.
+
+        The product's stored `retailer_products.barcode` is left alone; the new
+        value is recorded as a non-primary global identifier so nothing is lost.
+        DO NOTHING on conflict is deliberate: if this barcode already exists
+        globally it belongs to some product's match chain, and silently
+        re-pointing it would corrupt matching for whatever owns it.
+        """
+        if not alias_rows:
+            return
+        frag, params = self._unnest_sql(alias_rows, ("uuid", "uuid", "text", "text"))
+        self.cur.execute(
+            "INSERT INTO catalog.product_identifiers "
+            "(product_variant_id, canonical_product_id, retailer_id, identifier_type, "
+            " identifier_value, is_primary, source, first_seen_at, last_seen_at) "
+            "SELECT v.vid, v.cid, NULL, 'barcode', v.bc, false, v.source, now(), now() "
+            f"FROM {frag} AS v(cid, vid, bc, source) "
+            "ON CONFLICT (identifier_type, identifier_value) WHERE retailer_id IS NULL "
+            "AND identifier_type = ANY(ARRAY['barcode','gtin','ean','upc']"
+            "::catalog.product_identifier_type[]) DO NOTHING",
+            params)
+
+    def _queue_barcode_conflicts(self, conflict_rows: list) -> None:
+        """Same sku/source id, different barcode AND a different name — refuse to
+        guess. The stored barcode stays untouched and a human gets the evidence."""
+        if not conflict_rows:
+            return
+        from psycopg.types.json import Jsonb
+        rows = [(
+            rp_id, cid, vid, "barcode_conflict", "open", None,
+            Jsonb({
+                "existing_barcode": old_bc,
+                "incoming_barcode": rec["barcode"],
+                "existing_name": old_name,
+                "incoming_name": rec["clean_name"] or rec["raw_name"],
+                "retailer_sku": rec["retailer_sku"],
+                "source_product_id": rec["source_product_id"],
+                "brand": rec["brand"],
+                "size": rec["size"],
+            }),
+        ) for (rp_id, cid, vid, rec, old_bc, old_name) in conflict_rows]
+        frag, params = self._unnest_sql(
+            rows, ("uuid", "uuid", "uuid", "text", "text", "numeric", "jsonb"))
+        self.cur.execute(
+            "INSERT INTO catalog.product_match_reviews "
+            "(retailer_product_id, suggested_canonical_product_id, suggested_product_variant_id, "
+            " review_reason, status, score, raw_evidence) "
+            f"SELECT v.rp_id, v.scid, v.svid, v.reason, v.status, v.score, v.evidence "
+            f"FROM {frag} AS v(rp_id, scid, svid, reason, status, score, evidence) "
+            "ON CONFLICT (retailer_product_id, review_reason) WHERE status = 'open' "
+            "DO UPDATE SET raw_evidence = EXCLUDED.raw_evidence",
+            params)
+        self.reviews_created += len(rows)
+        self.barcode_conflicts += len(rows)
 
     # ---- stage: keep global barcode identifiers fresh ----------------------- #
     def _bulk_touch_identifiers(self, batch: list[dict]) -> None:
@@ -1719,17 +1834,19 @@ class Importer:
         existing = {}
         with self._stage("  bpc:select"):
             rows = self._all(
-                "SELECT retailer_product_id, id, current_price_cents, unit_price_cents, stock_status "
+                "SELECT retailer_product_id, id, current_price_cents, unit_price_cents, "
+                "stock_status, active_promotion_id "
                 "FROM catalog.branch_product_current "
                 "WHERE branch_id = %s AND retailer_product_id = ANY(%s)",
                 (self.branch_id, rp_ids))
-        for rp_id, bpc_id, old_price, old_unit, old_stock in rows:
-            existing[rp_id] = (bpc_id, old_price, old_unit, old_stock)
+        for rp_id, bpc_id, old_price, old_unit, old_stock, old_promo in rows:
+            existing[rp_id] = (bpc_id, old_price, old_unit, old_stock, old_promo)
 
         update_rows = []
         insert_idxs = []
         bpc_id_by_idx: list[Optional[str]] = [None] * n
-        history_rows = []  # (bpc_id, rp_id, cid, vid, promo_id, rec, old_price, old_unit, old_stock)
+        # (bpc_id, rp_id, cid, vid, promo_id, rec, old_price, old_unit, old_stock, events)
+        history_rows = []
 
         # Two batch records can resolve to the SAME retailer_product — e.g. a
         # spid-less record whose retailer_sku is owned by a spid-bearing row (see
@@ -1757,11 +1874,16 @@ class Importer:
             is_special = promo_ids[i] is not None
             hit = existing.get(rp_ids[i])
             if hit:
-                bpc_id, old_price, old_unit, old_stock = hit
+                bpc_id, old_price, old_unit, old_stock, old_promo = hit
                 bpc_id_by_idx[i] = bpc_id
                 price_changed = old_price != rec["current_price_cents"]
                 unit_changed = old_unit != rec["unit_price_cents"]
                 stock_changed = old_stock != rec["stock_status"]
+                # str() both sides: old_promo comes back as a uuid object, the new
+                # one is a string, and uuid != str is always True — which would
+                # log a promo_change on every single import.
+                promo_changed = (str(old_promo) if old_promo else None) != \
+                                (str(promo_ids[i]) if promo_ids[i] else None)
                 update_rows.append((
                     bpc_id, canonical_ids[i], variant_ids[i], rec["current_price_cents"],
                     rec["comparison_price_cents"], rec["unit_price_cents"], rec["unit_label"],
@@ -1770,9 +1892,11 @@ class Importer:
                     stock_changed, rec["observed_at"] if stock_changed else None,
                 ))
                 self.updated += 1
-                if price_changed or unit_changed or stock_changed:
+                events = _history_events(price_changed, unit_changed, stock_changed, promo_changed)
+                if events:
                     history_rows.append((bpc_id, rp_ids[i], canonical_ids[i], variant_ids[i],
-                                          promo_ids[i], rec, old_price, old_unit, old_stock))
+                                          promo_ids[i], rec, old_price, old_unit, old_stock,
+                                          events))
                     if price_changed:
                         self.price_changes += 1
             else:
@@ -1824,7 +1948,10 @@ class Importer:
                 # scraped_at still moves for every row we saw — that is the
                 # "we observed this product in this scrape" fact, and it is what
                 # keeps the branch from looking stale.
-                touch_sql="scraped_at = v.scraped_at, last_seen_at = now(), updated_at = now()")
+                # freshness only — scraped_at/last_seen_at record "we observed
+                # this product in this scrape"; updated_at stays put because
+                # nothing about the row's data actually changed.
+                touch_sql="scraped_at = v.scraped_at, last_seen_at = now()")
 
         if insert_idxs:
           with self._stage("  bpc:insert"):
@@ -1852,24 +1979,31 @@ class Importer:
                 bpc_id_by_idx[i] = new_bpc_ids[pos]
                 # baseline history row on first sighting
                 history_rows.append((new_bpc_ids[pos], rp_ids[i], canonical_ids[i], variant_ids[i],
-                                      promo_ids[i], batch[i], None, None, None))
+                                      promo_ids[i], batch[i], None, None, None,
+                                      ["initial_seen"]))
 
         if history_rows:
           with self._stage("  price_history"):
+            from psycopg.types.json import Jsonb
             hist_ins = [(
                 bpc_id, self.branch_id, rp_id, cid, vid, old_price, rec["current_price_cents"],
                 old_unit, rec["unit_price_cents"], old_stock, rec["stock_status"], promo_id,
                 self.run_id, rec["observed_at"],
-            ) for (bpc_id, rp_id, cid, vid, promo_id, rec, old_price, old_unit, old_stock) in history_rows]
+                # event_type = the dominant reason this row exists (for filtering a
+                # price chart); events = everything that changed at this instant, so
+                # a simultaneous price+stock move isn't lost.
+                Jsonb({"event_type": events[0], "events": events}),
+            ) for (bpc_id, rp_id, cid, vid, promo_id, rec, old_price, old_unit, old_stock,
+                   events) in history_rows]
             self._bulk_insert(
                 "catalog.price_history",
                 ("branch_product_id", "branch_id", "retailer_product_id", "canonical_product_id",
                  "product_variant_id", "old_price_cents", "new_price_cents", "old_unit_price_cents",
                  "new_unit_price_cents", "old_stock_status", "new_stock_status", "promotion_id",
-                 "source_run_id", "changed_at"),
+                 "source_run_id", "changed_at", "metadata"),
                 ("uuid", "uuid", "uuid", "uuid", "uuid", "integer", "integer", "integer",
                  "integer", "catalog.stock_status", "catalog.stock_status", "uuid", "uuid",
-                 "timestamptz"),
+                 "timestamptz", "jsonb"),
                 hist_ins)
 
         # Losers inherit the winner's bpc id: they are the same product in the same
@@ -2064,6 +2198,41 @@ def reap_all_stale_runs(older_than: str = STALE_RUN_AFTER) -> int:
     return n
 
 
+def _same_product_name(a: Optional[str], b: Optional[str]) -> bool:
+    """Are these two product names the same item, ignoring punctuation/spacing/case?
+
+    Used only to decide whether a NEW barcode on a known product is a second
+    barcode for the same item or a sign the identity is wrong. Deliberately
+    strict-ish and conservative: an empty/unknown name on either side returns
+    False, which routes to human review rather than silently accepting.
+    """
+    def norm(s: Optional[str]) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+    na, nb = norm(a), norm(b)
+    return bool(na) and na == nb
+
+
+def _history_events(price_changed: bool, unit_changed: bool, stock_changed: bool,
+                    promo_changed: bool) -> list[str]:
+    """Which events a price_history row represents, most significant first.
+
+    A single observation can carry several at once (a product going on special
+    usually moves price AND promo together), so all of them are recorded and
+    `events[0]` is the one a chart should filter on. Order is deliberate:
+    price_change outranks the rest so price charts stay clean.
+    """
+    events = []
+    if price_changed:
+        events.append("price_change")
+    if unit_changed:
+        events.append("unit_price_change")
+    if stock_changed:
+        events.append("stock_change")
+    if promo_changed:
+        events.append("promo_change")
+    return events
+
+
 def _importer_branch_stats(imp) -> dict:
     """Snapshot the per-branch importer counters for the JSON run log."""
     return {
@@ -2077,6 +2246,8 @@ def _importer_branch_stats(imp) -> dict:
         "barcodes_linked": imp.identifiers_created,
         "barcodes_refreshed": imp.identifiers_touched,
         "promos_deactivated": imp.promos_deactivated,
+        "barcodes_aliased": imp.barcodes_aliased,
+        "barcode_conflicts": imp.barcode_conflicts,
         "failed_rows": imp.failed,
         "sku_conflicts": imp.sku_conflicts,
         "rows_written": dict(imp.rows_written),
@@ -2295,6 +2466,8 @@ def run_db(args, records: list[dict], rollback: bool) -> int:
         f"  barcodes linked   : {imp.identifiers_created}",
         f"  barcodes refreshed: {imp.identifiers_touched} (last_seen_at bumped)",
         f"  promos deactivated: {imp.promos_deactivated} (ended — no product still on them)",
+        f"  extra barcodes kept: {imp.barcodes_aliased} (same name — added, nothing overwritten)",
+        f"  barcode conflicts : {imp.barcode_conflicts} (different name — queued for review)",
         f"  reviews resolved  : {imp.reviews_resolved}",
         f"  review queued     : {imp.reviews_created}",
         f"  failed rows       : {imp.failed}",
