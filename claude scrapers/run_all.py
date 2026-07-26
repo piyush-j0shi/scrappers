@@ -183,6 +183,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--ww-concurrency", type=int, default=CHAIN_DEFAULTS["woolworths"]["concurrency"])
     ap.add_argument("--nw-concurrency", type=int, default=CHAIN_DEFAULTS["newworld"]["concurrency"])
     ap.add_argument("--ps-concurrency", type=int, default=CHAIN_DEFAULTS["paknsave"]["concurrency"])
+    # Left as None = keep the scraper's own default rather than silently
+    # re-asserting a number here that could drift from it.
+    ap.add_argument("--nw-rate", type=float, default=None,
+                    help="New World req/sec ceiling (default: scraper's own, 12)")
+    ap.add_argument("--ps-rate", type=float, default=None,
+                    help="Pak'nSave req/sec ceiling (default: scraper's own, 12)")
     ap.add_argument("--skip", action="append", default=[],
                     choices=list(CHAIN_DEFAULTS.keys()),
                     help="Skip a chain (can repeat: --skip paknsave)")
@@ -210,6 +216,12 @@ def build_cmd_for_chain(chain: str, args: argparse.Namespace) -> list[str]:
     }
     conc = conc_map[chain]
     cmd += ["--concurrency", str(conc)]
+
+    # req/sec ceiling — Foodstuffs chains only (the WW scraper has no --rate;
+    # its throughput is governed by --concurrency over the proxy pool).
+    rate_map = {"newworld": args.nw_rate, "paknsave": args.ps_rate}
+    if chain in rate_map and rate_map[chain] is not None:
+        cmd += ["--rate", str(rate_map[chain])]
 
     if args.test:
         cmd.append("--test")

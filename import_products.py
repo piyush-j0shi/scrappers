@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -1084,18 +1085,27 @@ class Importer:
         # different barcode: same name => extra barcode, different name => review.
         rp_info: dict[str, tuple] = {}
         if spids or all_skus:
+            # NOTE: intentionally does NOT select raw_latest itself — that jsonb is
+            # ~91% of the row's weight and pulling it back would cost as much as the
+            # re-send we're avoiding. We fetch the cheap raw_latest_md5 fingerprint
+            # instead and every scalar the changed_sql below compares, so a row can
+            # be judged unchanged (and skipped BEFORE the COPY) without touching the
+            # blob. See _raw_latest_hash.
             rows = self._all(
                 "SELECT id, canonical_product_id, product_variant_id, source_product_id, "
-                "retailer_sku, barcode, clean_name "
+                "retailer_sku, barcode, clean_name, raw_name, brand_text, "
+                "raw_category_path, product_url, image_url, is_active, raw_latest_md5 "
                 "FROM catalog.retailer_products WHERE retailer_id = %s "
                 "AND (source_product_id = ANY(%s) OR retailer_sku = ANY(%s))",
                 (self.retailer_id, spids or [], all_skus or []))
-            for rp_id, cid, vid, spid, sku, old_bc, old_name in rows:
+            for (rp_id, cid, vid, spid, sku, old_bc, old_name, old_raw_name,
+                 old_brand, old_cat, old_url, old_img, old_active, old_hash) in rows:
                 key = ("spid", spid) if spid else ("sku", sku)
                 existing[key] = (rp_id, cid, vid)
                 if sku:
                     sku_owner[sku] = (rp_id, cid, vid)
-                rp_info[rp_id] = (old_bc, old_name)
+                rp_info[rp_id] = (old_bc, old_name, old_raw_name, old_brand, old_cat,
+                                  old_url, old_img, old_active, old_hash, sku)
 
         def ident(rec):
             return ("spid", rec["source_product_id"]) if rec["source_product_id"] \
@@ -1139,6 +1149,7 @@ class Importer:
         new_idxs = []
         alias_rows = []      # (cid, vid, barcode, source) — extra barcodes to keep
         conflict_rows = []   # (rp_id, cid, vid, rec, old_barcode, old_name)
+        hit_count = 0        # rows that resolved to an existing product (shipped or skipped)
         for i, rec in enumerate(batch):
             hit = existing.get(ident(rec))
             if hit is None and not rec["source_product_id"] and rec["retailer_sku"]:
@@ -1148,8 +1159,11 @@ class Importer:
                 # would collide on (retailer_id, retailer_sku).
                 hit = sku_owner.get(rec["retailer_sku"])
             if hit:
+                hit_count += 1
                 rp_ids[i], canonical_ids[i], variant_ids[i] = hit
-                old_bc, old_name = rp_info.get(rp_ids[i], (None, None))
+                (old_bc, old_name, old_raw_name, old_brand, old_cat, old_url,
+                 old_img, old_active, old_hash, old_sku) = rp_info.get(
+                    rp_ids[i], (None,) * 10)
                 new_bc = rec["barcode"]
                 if new_bc and old_bc and new_bc != old_bc:
                     # Same product identity (spid/sku) but a barcode we don't hold.
@@ -1163,13 +1177,44 @@ class Importer:
                     else:
                         conflict_rows.append((rp_ids[i], canonical_ids[i], variant_ids[i],
                                               rec, old_bc, old_name))
-                update_rows.append((
-                    rp_ids[i], sku_for(i, rec, rp_ids[i]), rec["raw_name"], rec["clean_name"],
-                    rec["brand"], rec["category_path"], rec["product_url"], rec["image_url"],
-                    rec["barcode"], Jsonb(rec["raw_row"] or {}),
-                ))
+                # sku_for() has side effects (sku_conflicts, claimed) and MUST be
+                # called exactly once per row — do it here and reuse the result.
+                wsku = sku_for(i, rec, rp_ids[i])
+                new_hash = _raw_latest_hash(rec["raw_row"])
+                # Ship this row to the COPY staging ONLY if something the UPDATE
+                # below would actually write. Each clause mirrors, one-for-one, a
+                # term of the server-side changed_sql (same COALESCE semantics),
+                # so this can never skip a row the database would have written — it
+                # only moves the identical decision upstream of the ~8-GB-per-chain
+                # jsonb transfer. A NULL stored hash (row never fingerprinted, e.g.
+                # right after the column was added) counts as changed, so the first
+                # run re-ships every row once and stamps its fingerprint.
+                changed = (
+                    old_raw_name != rec["raw_name"]                                   # raw_name = v.raw_name
+                    or old_active is not True                                         # is_active = true
+                    or (wsku is not None and wsku != old_sku)                         # retailer_sku COALESCE
+                    or (rec["clean_name"] is not None and rec["clean_name"] != old_name)
+                    or (rec["brand"] is not None and rec["brand"] != old_brand)
+                    or (rec["category_path"] is not None and rec["category_path"] != old_cat)
+                    or (rec["product_url"] is not None and rec["product_url"] != old_url)
+                    or (rec["image_url"] is not None and rec["image_url"] != old_img)
+                    or (rec["barcode"] is not None and old_bc is None)               # barcode fills a blank only
+                    or (new_hash is not None and new_hash != old_hash)               # raw_latest fingerprint
+                )
+                if changed:
+                    update_rows.append((
+                        rp_ids[i], wsku, rec["raw_name"], rec["clean_name"],
+                        rec["brand"], rec["category_path"], rec["product_url"], rec["image_url"],
+                        rec["barcode"], Jsonb(rec["raw_row"] or {}),
+                        new_hash if new_hash else "",
+                    ))
             else:
                 new_idxs.append(i)
+
+        # Rows judged unchanged by the pre-filter above were never appended — so
+        # the "skipped" count the run log used to get from the server-side
+        # changed_sql now comes from here instead.
+        self._write_tally("catalog.retailer_products", 0, hit_count - len(update_rows))
 
         if update_rows:
             # raw_latest: NULLIF('{}') keeps an existing populated card when this
@@ -1177,13 +1222,25 @@ class Importer:
             # a populated one) — mirrors the original per-row COALESCE(NULLIF(...)).
             # COPY-into-staging fast path (was a multi-row VALUES UPDATE, ~29% of
             # import time from parsing the giant literal).
+            #
+            # changed_sql is INTENTIONALLY None here. The Python pre-filter is now
+            # the sole change detector — every row in update_rows genuinely differs,
+            # so there is nothing left to filter server-side, and re-adding a
+            # changed_sql would be actively wrong: on the first run after this
+            # column was added, every row's stored fingerprint is NULL, so the
+            # fingerprint MUST be written to converge; a server-side changed_sql
+            # that found the jsonb unchanged would skip the write, leave the hash
+            # NULL, and re-ship that row on every future run forever. So the first
+            # run writes every resolved row once (stamping raw_latest_md5); from
+            # the second run on, only genuinely-changed rows are shipped at all.
             self._copy_update(
                 "catalog.retailer_products", "_stg_rp",
                 "id uuid, retailer_sku text, raw_name text, clean_name text, "
                 "brand_text text, raw_category_path text, product_url text, "
-                "image_url text, barcode text, raw_latest jsonb",
+                "image_url text, barcode text, raw_latest jsonb, raw_latest_md5 text",
                 ("id", "retailer_sku", "raw_name", "clean_name", "brand_text",
-                 "raw_category_path", "product_url", "image_url", "barcode", "raw_latest"),
+                 "raw_category_path", "product_url", "image_url", "barcode", "raw_latest",
+                 "raw_latest_md5"),
                 update_rows,
                 "retailer_sku = COALESCE(v.retailer_sku, t.retailer_sku), "
                 "raw_name = v.raw_name, "
@@ -1198,26 +1255,13 @@ class Importer:
                 # review when the name doesn't match) — see _classify_barcode.
                 "barcode = COALESCE(t.barcode, v.barcode), "
                 "raw_latest = COALESCE(NULLIF(v.raw_latest, '{}'::jsonb), t.raw_latest), "
+                # Keep the fingerprint in lockstep with raw_latest: when the
+                # incoming card is empty we keep the stored blob, so we must keep
+                # its stored hash too (v.raw_latest_md5 arrives as '' in that case).
+                "raw_latest_md5 = CASE WHEN v.raw_latest = '{}'::jsonb "
+                "  THEN t.raw_latest_md5 ELSE v.raw_latest_md5 END, "
                 "last_seen_at = now(), is_active = true, updated_at = now()",
-                # Cheap scalars first — OR short-circuits left to right, so a row
-                # that differs on a name/url never pays for the jsonb comparison.
-                # raw_latest goes last precisely because it has to detoast.
-                changed_sql=(
-                    "t.raw_name IS DISTINCT FROM v.raw_name"
-                    " OR t.is_active IS DISTINCT FROM true"
-                    " OR t.retailer_sku IS DISTINCT FROM COALESCE(v.retailer_sku, t.retailer_sku)"
-                    " OR t.clean_name IS DISTINCT FROM COALESCE(v.clean_name, t.clean_name)"
-                    " OR t.brand_text IS DISTINCT FROM COALESCE(v.brand_text, t.brand_text)"
-                    " OR t.raw_category_path IS DISTINCT FROM COALESCE(v.raw_category_path, t.raw_category_path)"
-                    " OR t.product_url IS DISTINCT FROM COALESCE(v.product_url, t.product_url)"
-                    " OR t.image_url IS DISTINCT FROM COALESCE(v.image_url, t.image_url)"
-                    # only true when t.barcode IS NULL and v.barcode is not, i.e.
-                    # we are filling a blank rather than replacing anything
-                    " OR t.barcode IS DISTINCT FROM COALESCE(t.barcode, v.barcode)"
-                    " OR t.raw_latest IS DISTINCT FROM COALESCE(NULLIF(v.raw_latest, '{}'::jsonb), t.raw_latest)"),
-                # freshness only — updated_at means "the data changed", so it is
-                # deliberately NOT written here (see the semantics note up top).
-                touch_sql="last_seen_at = now()")
+                changed_sql=None)
 
         # Both are no-ops when nothing conflicted, which is the overwhelming case.
         self._save_extra_barcodes(alias_rows)
@@ -1235,6 +1279,7 @@ class Importer:
                 batch[i]["clean_name"], batch[i]["brand"], batch[i]["category_path"],
                 batch[i]["product_url"], batch[i]["image_url"], batch[i]["barcode"],
                 batch[i]["source_product_id"], Jsonb(batch[i]["raw_row"] or {}), "unmatched",
+                _raw_latest_hash(batch[i]["raw_row"]),
             ) for i in new_idxs]
             # ON CONFLICT DO NOTHING instead of a bare INSERT: under --jobs>1 two
             # branches can both SELECT-miss the SAME brand-new shared product and
@@ -1259,12 +1304,12 @@ class Importer:
             frag, params = self._unnest_sql(
                 new_rows,
                 ("uuid", "text", "text", "text", "text", "text", "text", "text", "text",
-                 "text", "jsonb", "text"))
+                 "text", "jsonb", "text", "text"))
             self.cur.execute(
                 "INSERT INTO catalog.retailer_products "
                 "(retailer_id, retailer_sku, raw_name, clean_name, brand_text, "
                 " raw_category_path, product_url, image_url, barcode, source_product_id, "
-                " raw_latest, match_status) "
+                " raw_latest, match_status, raw_latest_md5) "
                 f"SELECT * FROM {frag} "
                 "ON CONFLICT (retailer_id, source_product_id) DO NOTHING "
                 "RETURNING id, source_product_id, retailer_sku",
@@ -1748,7 +1793,13 @@ class Importer:
                 "  ON pr.promo_type::text = want.ptype "
                 "  AND pr.raw_promo_text IS NOT DISTINCT FROM want.ptext "
                 "  AND pr.source_promotion_id IS NOT DISTINCT FROM want.psid "
-                "WHERE pr.retailer_id = %s AND pr.branch_id = %s AND pr.is_active = true",
+                # NOT filtered on is_active: sweep_unseen() deactivates ended
+                # promos, and when one returns in a later scrape this lookup MUST
+                # still find it — otherwise it is treated as new and the INSERT
+                # below collides with the still-present (deactivated) row on
+                # promotions_source_unique_idx. The existing-row UPDATE further
+                # down sets is_active = true, so a found promo is reactivated.
+                "WHERE pr.retailer_id = %s AND pr.branch_id = %s",
                 (types_, texts_, sids_, self.retailer_id, self.branch_id)
             ):
                 self._promo_cache[(ptype, ptext, psid)] = pid
@@ -1762,6 +1813,21 @@ class Importer:
                     creator_for.setdefault(k, i)
             if creator_for:
                 keys = list(creator_for.keys())
+                # A single INSERT must not target the same conflict row twice or
+                # ON CONFLICT DO UPDATE raises CardinalityViolation. retailer/branch/
+                # source are constant here, so the unique-index identity reduces to
+                # source_promotion_id: dedupe the INSERT to one row per non-NULL psid,
+                # then point every same-psid key at that representative's id. NULL-psid
+                # keys have no unique index, so each stays its own row (unchanged).
+                rep_for_psid: dict[str, tuple] = {}
+                insert_keys = []
+                for k in keys:
+                    psid = k[2]
+                    if psid is None:
+                        insert_keys.append(k)
+                    elif psid not in rep_for_psid:
+                        rep_for_psid[psid] = k
+                        insert_keys.append(k)
                 rows = [(
                     self.retailer_id, self.branch_id, k[0], batch[creator_for[k]]["promo_text"],
                     batch[creator_for[k]]["promo_text"], batch[creator_for[k]]["card_required"],
@@ -1769,17 +1835,37 @@ class Importer:
                     k[2], batch[creator_for[k]]["promo_starts_at"],
                     batch[creator_for[k]]["promo_ends_at"],
                     Jsonb(batch[creator_for[k]]["promo_metadata"] or {}),
-                ) for k in keys]
-                new_ids = self._bulk_insert(
-                    "catalog.promotions",
-                    ("retailer_id", "branch_id", "promo_type", "title", "raw_promo_text",
-                     "card_required", "source", "required_loyalty_program_id",
-                     "source_promotion_id", "starts_at", "ends_at", "metadata"),
-                    ("uuid", "uuid", "catalog.promo_type", "text", "text", "boolean", "text", "uuid",
-                     "text", "timestamptz", "timestamptz", "jsonb"),
-                    rows, returning="id")
-                for k, pid in zip(keys, new_ids):
-                    self._promo_cache[k] = pid
+                ) for k in insert_keys]
+                # ON CONFLICT backstop: if the lookup still missed an existing
+                # promo (e.g. the retailer changed the promo TEXT but kept the same
+                # source_promotion_id, so the natural-key match fails while the
+                # unique index still collides), reuse that row instead of erroring.
+                # DO UPDATE (not DO NOTHING) is required so RETURNING yields one id
+                # per input row IN ORDER — the position mapping below depends on it.
+                # The arbiter is the PARTIAL index (source_promotion_id IS NOT NULL);
+                # NULL-source promos (Woolworths) don't match it and just insert, as
+                # before — they have no unique index to collide on.
+                frag, params = self._unnest_sql(
+                    rows,
+                    ("uuid", "uuid", "catalog.promo_type", "text", "text", "boolean", "text",
+                     "uuid", "text", "timestamptz", "timestamptz", "jsonb"))
+                self.cur.execute(
+                    "INSERT INTO catalog.promotions "
+                    "(retailer_id, branch_id, promo_type, title, raw_promo_text, "
+                    " card_required, source, required_loyalty_program_id, "
+                    " source_promotion_id, starts_at, ends_at, metadata) "
+                    f"SELECT * FROM {frag} "
+                    "ON CONFLICT (retailer_id, branch_id, source, source_promotion_id) "
+                    "WHERE source_promotion_id IS NOT NULL "
+                    "DO UPDATE SET is_active = true, updated_at = now() "
+                    "RETURNING id",
+                    params)
+                new_ids = [r[0] for r in self.cur.fetchall()]
+                id_of_insert_key = dict(zip(insert_keys, new_ids))
+                for k in keys:
+                    psid = k[2]
+                    rep = k if psid is None else rep_for_psid[psid]
+                    self._promo_cache[k] = id_of_insert_key[rep]
 
         existing_update_rows = []
         for i in promo_idxs:
@@ -1845,7 +1931,8 @@ class Importer:
         update_rows = []
         insert_idxs = []
         bpc_id_by_idx: list[Optional[str]] = [None] * n
-        # (bpc_id, rp_id, cid, vid, promo_id, rec, old_price, old_unit, old_stock, events)
+        # (bpc_id, rp_id, cid, vid, rec, old_price, old_unit, old_stock,
+        #  change_types, old_promotion_id, new_promotion_id, promotion_id_backcompat)
         history_rows = []
 
         # Two batch records can resolve to the SAME retailer_product — e.g. a
@@ -1879,11 +1966,6 @@ class Importer:
                 price_changed = old_price != rec["current_price_cents"]
                 unit_changed = old_unit != rec["unit_price_cents"]
                 stock_changed = old_stock != rec["stock_status"]
-                # str() both sides: old_promo comes back as a uuid object, the new
-                # one is a string, and uuid != str is always True — which would
-                # log a promo_change on every single import.
-                promo_changed = (str(old_promo) if old_promo else None) != \
-                                (str(promo_ids[i]) if promo_ids[i] else None)
                 update_rows.append((
                     bpc_id, canonical_ids[i], variant_ids[i], rec["current_price_cents"],
                     rec["comparison_price_cents"], rec["unit_price_cents"], rec["unit_label"],
@@ -1892,11 +1974,22 @@ class Importer:
                     stock_changed, rec["observed_at"] if stock_changed else None,
                 ))
                 self.updated += 1
-                events = _history_events(price_changed, unit_changed, stock_changed, promo_changed)
-                if events:
+                change_types, old_pid, new_pid = _change_types(
+                    price_changed, unit_changed, stock_changed, old_promo, promo_ids[i])
+                # Insert ONLY when at least one tracked thing changed — never just
+                # because the product was seen again (same rule as before).
+                if change_types:
+                    # Backward-compat single promotion_id: which side of the promo
+                    # transition to expose to the old consumers (spec §backward-compat).
+                    if "promo_removed" in change_types:
+                        promo_bc = old_pid                 # the promo that just ended
+                    elif new_pid is not None:
+                        promo_bc = new_pid                 # promo_added / promo_changed
+                    else:
+                        promo_bc = promo_ids[i]            # no promo move; keep current
                     history_rows.append((bpc_id, rp_ids[i], canonical_ids[i], variant_ids[i],
-                                          promo_ids[i], rec, old_price, old_unit, old_stock,
-                                          events))
+                                          rec, old_price, old_unit, old_stock,
+                                          change_types, old_pid, new_pid, promo_bc))
                     if price_changed:
                         self.price_changes += 1
             else:
@@ -1977,34 +2070,51 @@ class Importer:
             self.inserted += len(new_bpc_ids)
             for pos, i in enumerate(insert_idxs):
                 bpc_id_by_idx[i] = new_bpc_ids[pos]
-                # baseline history row on first sighting
+                # baseline history row on first sighting. change_types is exactly
+                # ["initial_seen"]; the promo it was first seen with (if any) is
+                # preserved in new_promotion_id + the backward-compat promotion_id
+                # so a product born on special isn't recorded promo-less.
                 history_rows.append((new_bpc_ids[pos], rp_ids[i], canonical_ids[i], variant_ids[i],
-                                      promo_ids[i], batch[i], None, None, None,
-                                      ["initial_seen"]))
+                                      batch[i], None, None, None,
+                                      ["initial_seen"], None, promo_ids[i], promo_ids[i]))
 
         if history_rows:
           with self._stage("  price_history"):
             from psycopg.types.json import Jsonb
+            # change_types is text[]; a per-column unnest() would FLATTEN a 2-D
+            # array, so it is shipped as a comma-joined text (its tokens never
+            # contain commas) and rebuilt with string_to_array() in the SELECT.
             hist_ins = [(
-                bpc_id, self.branch_id, rp_id, cid, vid, old_price, rec["current_price_cents"],
-                old_unit, rec["unit_price_cents"], old_stock, rec["stock_status"], promo_id,
+                bpc_id, self.branch_id, rp_id, cid, vid,
+                old_price, rec["current_price_cents"],
+                old_unit, rec["unit_price_cents"],
+                old_stock, rec["stock_status"],
+                promo_bc, old_pid, new_pid,
+                ",".join(change_types),
                 self.run_id, rec["observed_at"],
-                # event_type = the dominant reason this row exists (for filtering a
-                # price chart); events = everything that changed at this instant, so
-                # a simultaneous price+stock move isn't lost.
-                Jsonb({"event_type": events[0], "events": events}),
-            ) for (bpc_id, rp_id, cid, vid, promo_id, rec, old_price, old_unit, old_stock,
-                   events) in history_rows]
-            self._bulk_insert(
-                "catalog.price_history",
-                ("branch_product_id", "branch_id", "retailer_product_id", "canonical_product_id",
-                 "product_variant_id", "old_price_cents", "new_price_cents", "old_unit_price_cents",
-                 "new_unit_price_cents", "old_stock_status", "new_stock_status", "promotion_id",
-                 "source_run_id", "changed_at", "metadata"),
+                # metadata mirrors change_types for consumers still reading it;
+                # change_types / old_promotion_id / new_promotion_id are the
+                # authoritative, unambiguous fields going forward.
+                Jsonb({"event_type": change_types[0], "events": change_types}),
+            ) for (bpc_id, rp_id, cid, vid, rec, old_price, old_unit, old_stock,
+                   change_types, old_pid, new_pid, promo_bc) in history_rows]
+            frag, params = self._unnest_sql(
+                hist_ins,
                 ("uuid", "uuid", "uuid", "uuid", "uuid", "integer", "integer", "integer",
                  "integer", "catalog.stock_status", "catalog.stock_status", "uuid", "uuid",
-                 "timestamptz", "jsonb"),
-                hist_ins)
+                 "uuid", "text", "uuid", "timestamptz", "jsonb"))
+            self.cur.execute(
+                "INSERT INTO catalog.price_history ("
+                "branch_product_id, branch_id, retailer_product_id, canonical_product_id, "
+                "product_variant_id, old_price_cents, new_price_cents, old_unit_price_cents, "
+                "new_unit_price_cents, old_stock_status, new_stock_status, promotion_id, "
+                "old_promotion_id, new_promotion_id, change_types, source_run_id, changed_at, "
+                "metadata) "
+                "SELECT bpid, bid, rpid, cid, vid, op, np, ou, nu, os, ns, promo, opid, npid, "
+                "string_to_array(ct, ','), run, chg, meta "
+                f"FROM {frag} AS v(bpid, bid, rpid, cid, vid, op, np, ou, nu, os, ns, promo, "
+                "opid, npid, ct, run, chg, meta)",
+                params)
 
         # Losers inherit the winner's bpc id: they are the same product in the same
         # branch, so anything keyed off branch_product_id still resolves.
@@ -2212,25 +2322,72 @@ def _same_product_name(a: Optional[str], b: Optional[str]) -> bool:
     return bool(na) and na == nb
 
 
-def _history_events(price_changed: bool, unit_changed: bool, stock_changed: bool,
-                    promo_changed: bool) -> list[str]:
-    """Which events a price_history row represents, most significant first.
+def _raw_latest_hash(raw_row) -> Optional[str]:
+    """Stable fingerprint of a product's raw detail card, used to decide whether
+    the (large, ~91%-of-payload) raw_latest jsonb actually changed WITHOUT
+    shipping it to the database every run.
 
-    A single observation can carry several at once (a product going on special
-    usually moves price AND promo together), so all of them are recorded and
-    `events[0]` is the one a chart should filter on. Order is deliberate:
-    price_change outranks the rest so price charts stay clean.
+    Returns None for an empty/absent card — matching the importer's rule that an
+    empty card never overwrites a stored one (COALESCE(NULLIF(v.raw_latest,'{}'),
+    t.raw_latest)); a None hash therefore means "no raw_latest change from this
+    row" and also "don't touch the stored hash".
+
+    Determinism is the whole point: the value is compared only against a hash
+    THIS function produced on a previous run (stored in raw_latest_md5), never
+    against Postgres's own jsonb rendering — so as long as identical input yields
+    identical output run-to-run, the comparison is exact. sort_keys + compact
+    separators guarantee that; default=str keeps any stray non-JSON value from
+    raising rather than hashing.
     """
-    events = []
+    if not raw_row:
+        return None
+    blob = json.dumps(raw_row, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, default=str)
+    return hashlib.md5(blob.encode("utf-8")).hexdigest()
+
+
+def _change_types(price_changed: bool, unit_changed: bool, stock_changed: bool,
+                  old_promo, new_promo) -> tuple[list[str], Optional[str], Optional[str]]:
+    """Build a price_history row's `change_types` array plus its old/new promo ids.
+
+    Vocabulary the analytics layer reads (order deliberate — price first so a
+    price chart can filter on change_types[1]):
+      price_changed, unit_price_changed, stock_changed,
+      promo_added, promo_removed, promo_changed
+    (`initial_seen` is emitted by the first-sighting path, not here.)
+
+    The promo transition is derived by comparing the STRING form of the two ids:
+    old_promo arrives from the DB as a uuid object and new_promo as a str, so a
+    raw `!=` is always True and would log a phantom promo change every import.
+    The exact condition `str(old) != str(new)` is identical to the previous
+    `promo_changed` flag, so this records neither more nor fewer history rows than
+    before — it only labels them precisely and fills the two id columns.
+
+    Returns (change_types, old_promotion_id, new_promotion_id); the ids are the
+    ACTUAL values to store (each None unless that side of a transition exists).
+    """
+    types: list[str] = []
     if price_changed:
-        events.append("price_change")
+        types.append("price_changed")
     if unit_changed:
-        events.append("unit_price_change")
+        types.append("unit_price_changed")
     if stock_changed:
-        events.append("stock_change")
-    if promo_changed:
-        events.append("promo_change")
-    return events
+        types.append("stock_changed")
+    o = str(old_promo) if old_promo else None
+    nw = str(new_promo) if new_promo else None
+    old_pid = new_pid = None
+    if o != nw:
+        if o is None:                       # nothing -> a promo
+            types.append("promo_added")
+            new_pid = new_promo
+        elif nw is None:                    # a promo -> nothing (promo ended)
+            types.append("promo_removed")
+            old_pid = old_promo
+        else:                               # one promo swapped for another
+            types.append("promo_changed")
+            old_pid = old_promo
+            new_pid = new_promo
+    return types, old_pid, new_pid
 
 
 def _importer_branch_stats(imp) -> dict:
