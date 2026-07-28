@@ -42,8 +42,8 @@ python3 woolworths_claude.py --all-branches --concurrency 5 --fast-categories
 # With proxy pool (recommended — reduces Akamai block rate)
 python3 woolworths_claude.py --all-branches --concurrency 5 --fast-categories --proxy-file proxiesthatwork.txt
 
-# Single branch test, no DB writes
-python3 woolworths_claude.py --test --fast-categories --dry-run
+# Single branch test (small, fast sanity check)
+python3 woolworths_claude.py --test --fast-categories
 
 # Single named branch
 python3 woolworths_claude.py --branch "Woolworths Ponsonby" --fast-categories
@@ -58,7 +58,7 @@ python3 woolworths_claude.py --branch "Woolworths Ponsonby" --fast-categories
 | `--fast-categories` | Use direct-API fast path for pages 2..N — skip browser navigation |
 | `--proxy-file FILE` | Round-robin proxy pool (one URL per line) |
 | `--test` | 3 categories, default branch only (Ponsonby) |
-| `--dry-run` | Scrape but skip all Supabase writes |
+| `--dry-run` | ⚠️ **Currently a no-op.** `self.dry_run` is stored but never checked — the JSONL export (`_export_jsonl`) runs unconditionally regardless of this flag. It used to skip the direct Supabase write; that write path is now commented out entirely, so there's nothing left for `--dry-run` to skip. Use `--test` for a small sanity-check run instead. |
 | `--no-headless` | Show the browser window |
 
 **Log location:** `logs/woolworths_YYYY-MM-DD.log`
@@ -119,7 +119,7 @@ The first category per branch uses full browser navigation to load the page and 
 
 If `_scrape_category_direct` returns `None` (0 products, HTTP error, or missing template), the caller automatically falls back to the full browser navigation path (`scrape_one_category`). Fallback is transparent — no data is lost.
 
-**3. Non-blocking Supabase writes**
+**3. Non-blocking Supabase writes** *(historical — superseded, see [Two-stage pipeline](#two-stage-pipeline-scrapers--jsonl--pico-prod-import) below. The scraper now exports JSONL instead of writing to the DB directly; `_save_to_supabase` is no longer called.)*
 
 The Supabase Python SDK is synchronous. Instead of blocking the asyncio event loop while writing ~20,000 products per branch, the write is offloaded to a thread pool:
 
@@ -156,9 +156,9 @@ python3 newworld_claude.py --all-branches --concurrency 5 --fast-categories
 # Pak'nSave — full run, 58 branches, 5 parallel
 python3 paknsave_claude.py --all-branches --concurrency 5 --fast-categories
 
-# Single branch test, no DB writes
-python3 newworld_claude.py --test --fast-categories --dry-run
-python3 paknsave_claude.py --test --fast-categories --dry-run
+# Single branch test (small, fast sanity check)
+python3 newworld_claude.py --test --fast-categories
+python3 paknsave_claude.py --test --fast-categories
 
 # Resume an interrupted run (skips already-finished branches)
 python3 newworld_claude.py --all-branches --concurrency 5 --fast-categories --resume
@@ -180,7 +180,7 @@ python3 paknsave_claude.py --branch "PAK'nSAVE Sylvia Park" --fast-categories
 | `--no-adaptive-drop` | Keep concurrency fixed even when CF blocks hit |
 | `--capsolver` | Force CapSolver for the Cloudflare solve instead of the free headless UA-spoof (needs setup — see [Cloudflare solving](#cloudflare-solving--free-headless--capsolver-fallback)). Even **without** this flag, CapSolver is used automatically as a fallback when a headless solve is weak. |
 | `--test` | 3 categories, default branch only |
-| `--dry-run` | Scrape but skip Supabase writes |
+| `--dry-run` | ⚠️ **Currently a no-op** — same as Woolworths (see note above). `self.dry_run` is stored but never checked; the JSONL export runs regardless. Use `--test` for a small sanity-check run instead. |
 
 **Log location:** `logs/newworld_YYYY-MM-DD.log` / `logs/paknsave_YYYY-MM-DD.log`
 
@@ -245,7 +245,7 @@ A background task re-solves automatically every 25 minutes so no worker ever get
 
 The first category per branch captures the POST body + headers from browser navigation. Every subsequent category replays that captured request with only the category filter changed — no browser navigation needed. Falls back silently to browser if the direct path returns nothing.
 
-**6. Non-blocking Supabase writes**
+**6. Non-blocking Supabase writes** *(historical — superseded, see [Two-stage pipeline](#two-stage-pipeline-scrapers--jsonl--pico-prod-import) below. Foodstuffs now exports JSONL instead of writing to the DB directly; `_save_to_supabase` is no longer called.)*
 
 Synchronous Supabase SDK offloaded to thread pool so the event loop stays free for other branches during DB writes.
 
@@ -432,6 +432,149 @@ Success looks like:
 
 ---
 
+## Two-stage pipeline: scrapers → JSONL → pico-prod import
+
+**This is the current architecture.** All three scrapers (`woolworths_claude.py`, `newworld_claude.py`, `paknsave_claude.py`) now write **one JSONL file per branch per run** and do **not** write to any database themselves. The old "Non-blocking Supabase writes" behaviour described in the fix sections above (`_save_to_supabase`) is superseded — that method still exists in each scraper file but its call site is commented out. A separate importer, `import_products.py`, is the only thing that writes to the database.
+
+```text
+retailer scraper  →  jsonl_export.write_jsonl()  →  exports/{scraper}_{branch}_{UTC timestamp}.jsonl
+                                                              ↓
+                                              import_products.py --input ... --retailer ...
+                                                              ↓
+                                                    pico-prod (Supabase project vppgakwhejaigjuizdql)
+                                                    catalog.* / ingest.* schemas
+```
+
+### Stage 1 — JSONL export (`jsonl_export.py`)
+
+Shared by all three scrapers via `from jsonl_export import write_jsonl, to_cents, clean_record`. One line = one product observation, money as integer cents, timestamps UTC ISO-8601. Files land in `exports/` (repo root) by default, named:
+
+```
+{scraper}_{branch-slug}_{YYYYMMDDTHHMMSSZ}.jsonl
+```
+
+e.g. `newworld_new-world-albany_20260709T060539Z.jsonl`, `woolworths_woolworths-westgate_20260707T092337Z.jsonl`.
+
+**Branch slug note:** New World and Woolworths export filenames match the pico-prod `branches.slug` column exactly. **Pak'nSave export filenames use `pak-nsave-*` but the pico-prod DB slug is `paknsave-*`** — pass `--branch-slug` explicitly to `import_products.py` when importing Pak'nSave rather than relying on filename parsing.
+
+### Stage 2 — import into pico-prod (`import_products.py`)
+
+Reads one export file and owns **all** pico-prod writes: `ingest.scraped_observations`, `catalog.retailer_products`, `catalog.branch_product_current`, `catalog.price_history`, plus product matching (see below). Connects via `DATABASE_URL` (Supabase Postgres pooler) from `.env` — this is a secret and is never printed.
+
+**Modes:**
+
+| Mode | Flag | What it does |
+|---|---|---|
+| Validate only | `--dry-run` | Parses and validates every row, no DB connection at all |
+| Test the DB path | `--rollback-test` | Runs the full import inside one transaction, then rolls back — nothing persisted |
+| Real import | *(no flag)* | Full import, commits |
+| Real import, full branch | `--full-branch` | Also marks products not seen in this run `out_of_stock` and deactivates their stale specials — only safe after a **complete** branch scrape |
+
+**Key args:**
+
+| Flag | Meaning |
+|---|---|
+| `--input PATH` | JSONL/JSON/CSV export file (required) |
+| `--retailer SLUG` | e.g. `new-world`, `paknsave`, `woolworths` (required) |
+| `--source-system NAME` | `ingest.source_systems.name`, default `scraper` |
+| `--external-store-id` / `--branch-slug` / `--branch-code` / `--branch-name` | Branch resolution, tried in that preferred order |
+| `--limit N` | Import only the first N unique products (testing). Disables the out-of-stock sweep so it won't touch unrelated rows |
+
+**Examples — every command, per retailer:**
+
+Run these from the repo root (`/home/boiledpotato/Downloads/scrapers`), not from `claude scrapers/`.
+
+**New World** (export filename slug and DB `branches.slug` match exactly):
+
+```bash
+# 1. Validate only — no DB connection at all
+python import_products.py --input exports/newworld_new-world-albany_20260709T060539Z.jsonl \
+    --retailer new-world --branch-slug new-world-albany --source-system newworld_scraper --dry-run
+
+# 2. Exercise the full DB path safely — rolls back, nothing persisted
+python import_products.py --input exports/newworld_new-world-albany_20260709T060539Z.jsonl \
+    --retailer new-world --branch-slug new-world-albany --source-system newworld_scraper --rollback-test
+
+# 3. Real import, small test batch (first 1000 unique products, commits)
+python import_products.py --input exports/newworld_new-world-albany_20260709T060539Z.jsonl \
+    --retailer new-world --branch-slug new-world-albany --source-system newworld_scraper --limit 1000
+
+# 4. Real import, whole file, commits (no out-of-stock sweep)
+python import_products.py --input exports/newworld_new-world-albany_20260709T060539Z.jsonl \
+    --retailer new-world --branch-slug new-world-albany --source-system newworld_scraper
+
+# 5. Real import, full branch — commits AND marks unseen products out_of_stock
+#    (only safe after a COMPLETE branch scrape, not a partial/interrupted one)
+python import_products.py --input exports/newworld_new-world-albany_20260709T060539Z.jsonl \
+    --retailer new-world --branch-slug new-world-albany --source-system newworld_scraper --full-branch
+```
+
+**Pak'nSave** — ⚠️ export filename uses `pak-nsave-*` but the pico-prod DB slug is `paknsave-*`. Always pass `--branch-slug` explicitly with the DB spelling; do not let it default from the filename.
+
+```bash
+# 1. Validate only
+python import_products.py --input exports/paknsave_pak-nsave-sylvia-park_20260708T150133Z.jsonl \
+    --retailer paknsave --branch-slug paknsave-sylvia-park --source-system paknsave_scraper --dry-run
+
+# 2. Rollback test
+python import_products.py --input exports/paknsave_pak-nsave-sylvia-park_20260708T150133Z.jsonl \
+    --retailer paknsave --branch-slug paknsave-sylvia-park --source-system paknsave_scraper --rollback-test
+
+# 3. Real import, small test batch
+python import_products.py --input exports/paknsave_pak-nsave-sylvia-park_20260708T150133Z.jsonl \
+    --retailer paknsave --branch-slug paknsave-sylvia-park --source-system paknsave_scraper --limit 1000
+
+# 4. Real import, whole file, commits
+python import_products.py --input exports/paknsave_pak-nsave-sylvia-park_20260708T150133Z.jsonl \
+    --retailer paknsave --branch-slug paknsave-sylvia-park --source-system paknsave_scraper
+
+# 5. Real import, full branch
+python import_products.py --input exports/paknsave_pak-nsave-sylvia-park_20260708T150133Z.jsonl \
+    --retailer paknsave --branch-slug paknsave-sylvia-park --source-system paknsave_scraper --full-branch
+```
+
+**Woolworths** (export filename slug and DB slug match exactly):
+
+```bash
+# 1. Validate only
+python import_products.py --input exports/woolworths_woolworths-westgate_20260707T092337Z.jsonl \
+    --retailer woolworths --branch-slug woolworths-westgate --source-system woolworths_scraper --dry-run
+
+# 2. Rollback test
+python import_products.py --input exports/woolworths_woolworths-westgate_20260707T092337Z.jsonl \
+    --retailer woolworths --branch-slug woolworths-westgate --source-system woolworths_scraper --rollback-test
+
+# 3. Real import, small test batch
+python import_products.py --input exports/woolworths_woolworths-westgate_20260707T092337Z.jsonl \
+    --retailer woolworths --branch-slug woolworths-westgate --source-system woolworths_scraper --limit 1000
+
+# 4. Real import, whole file, commits
+python import_products.py --input exports/woolworths_woolworths-westgate_20260707T092337Z.jsonl \
+    --retailer woolworths --branch-slug woolworths-westgate --source-system woolworths_scraper
+
+# 5. Real import, full branch
+python import_products.py --input exports/woolworths_woolworths-westgate_20260707T092337Z.jsonl \
+    --retailer woolworths --branch-slug woolworths-westgate --source-system woolworths_scraper --full-branch
+```
+
+A full-branch import aborts if more than 0.5% of rows fail validation (protects against importing a broken/partial scrape). `--limit` and `--full-branch` are mutually exclusive in practice — `--limit` disables the out-of-stock sweep, so combining them with a partial row count would incorrectly mark untouched products out of stock.
+
+### Product matching (canonical products, variants, barcodes)
+
+`import_products.py` also matches every retailer product to a canonical product so the same real-world item is recognized across all three chains. Matching cascade, in order:
+
+1. **Global barcode match** — `catalog.product_identifiers` (barcode/gtin/ean/upc) already links this barcode to a canonical product → link directly.
+2. **Cross-retailer barcode match** — another retailer's `retailer_products` row has this barcode and is already matched → link + register the global identifier.
+3. **New barcode** — no existing match anywhere → create a new canonical product + variant, register the barcode as a new global identifier.
+4. **No barcode** — fall back to exact brand + name + size match against existing canonical products; if none found, create a new canonical product/variant (as long as size is known).
+5. **Send to review** (`catalog.product_match_reviews`) only on a genuine conflict — e.g. same barcode already linked to a different-looking product, or size can't be reconciled. Most products are **not** sent to review; matching happens automatically.
+
+The only conflict signal used is the structured `size` field (not product-name text — measured across ~14,800 real cross-chain matches and found name-similarity to be unreliable, since retailers word the same product differently).
+
+**Do not delete `exports/*.jsonl` files** until you're sure the import succeeded — they're the only record of a scrape run outside the database.
+
+---
+
 ## Monitor API & Dashboard
 
 Branch results are POSTed to a local FastAPI server after every branch completes across all three scrapers.
@@ -543,3 +686,25 @@ grep "DONE" logs/woolworths_2026-06-08.log
 |---|---|
 | `.newworld_checkpoint.json` | New World |
 | `.paknsave_checkpoint.json` | PAK'nSAVE |
+
+---
+
+## Shareable package layout — where each file goes
+
+A trimmed copy of this project for handing to business/another dev lives at `~/Downloads/shareable/` — a flat folder (one `cache/` subdirectory, nothing else nested). It is **not** a working checkout — every file needs to be placed into the real repo layout below before anything will run. ⚠️ It contains the live `.env` (real `SUPABASE_SERVICE_ROLE_KEY`, `DATABASE_URL` with a plaintext DB password, `CAPSOLVER_API_KEY`) — treat the whole folder as secret, don't upload it anywhere public (Slack/email is fine for a trusted recipient; a public repo or drive link is not).
+
+- `.env` → place at `scrapers/.env`
+- `requirements.txt` → place at `scrapers/requirements.txt`
+- `newworld_claude.py` → place at `scrapers/claude scrapers/newworld_claude.py`
+- `paknsave_claude.py` → place at `scrapers/claude scrapers/paknsave_claude.py`
+- `woolworths_claude.py` → place at `scrapers/claude scrapers/woolworths_claude.py`
+- `foodstuffs_claude.py` → place at `scrapers/claude scrapers/foodstuffs_claude.py`
+- `jsonl_export.py` → place at `scrapers/claude scrapers/jsonl_export.py` — hard dependency of all 4 scraper files above (imported directly, they won't start without it)
+- `import_products.py` → place at `scrapers/import_products.py` — repo ROOT, not inside `claude scrapers/` (see "Two-stage pipeline" above for why)
+- `OPERATIONS.md` → this file; place at `scrapers/claude scrapers/OPERATIONS.md`
+- `cache/foodstuffs_cache.json` → place at `scrapers/claude scrapers/.foodstuffs_cache.json` — re-add the leading dot; shared productId→barcode cache for BOTH New World and Pak'nSave, since they're the same Foodstuffs catalogue. Do not delete/skip this; losing it forces a full barcode re-enrichment.
+- `cache/woolworths_detail_cache.json` → place at `scrapers/claude scrapers/.woolworths_detail_cache.json` — re-add the leading dot; Woolworths product detail cache, incl. nutrition info
+
+There are only **two** cache files, not one per chain — `foodstuffs_cache.json` already covers two of the three scrapers (New World + Pak'nSave). Both need their leading `.` restored on the destination filename (dropped in the shareable copy since dotfiles are easy to miss when browsing).
+
+Not included in this package (create fresh on the target machine): `.venv/`, `logs/`, `exports/`, `.newworld_checkpoint.json`, `.paknsave_checkpoint.json`, `.newworld_direct_template.json`, `.paknsave_direct_template.json` — these are either regenerable or machine/run-specific.

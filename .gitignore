@@ -18,6 +18,10 @@ logs/
 .newworld_checkpoint.json
 .paknsave_checkpoint.json
 .foodstuffs_cache.json
+.woolworths_detail_cache.json
+
+# JSONL exports (Scraper Data Contract output — Stage 1 of the import pipeline)
+exports/
 
 # Proxy lists (contain credentials/IPs)
 proxiesthatwork.txt
