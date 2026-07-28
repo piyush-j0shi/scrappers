@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from dotenv import load_dotenv
 # from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from patchright.async_api import async_playwright, Browser, BrowserContext, Page
@@ -969,6 +970,26 @@ class BarcodeCache:
 # Scraper
 # ---------------------------------------------------------------------------
 
+class _DirectResp:
+    """Adapt an httpx.Response to the playwright APIResponse interface the direct-POST
+    callers expect (.status / .ok / await .json())."""
+    __slots__ = ("_r",)
+
+    def __init__(self, r: "httpx.Response") -> None:
+        self._r = r
+
+    @property
+    def status(self) -> int:
+        return self._r.status_code
+
+    @property
+    def ok(self) -> bool:
+        return self._r.is_success
+
+    async def json(self):
+        return self._r.json()
+
+
 class FoodstuffsScraper:
     def __init__(
         self,
@@ -1032,6 +1053,7 @@ class FoodstuffsScraper:
         self._token_request: Optional[dict] = None      # captured token-mint request
         self._token_seen_version: int = 0               # last refresh version this worker adopted
         self._captured_token_request: Optional[dict] = None  # discovered during the browser pass
+        self._direct_client: Optional[httpx.AsyncClient] = None  # proxy-less api-prod POSTs
 
     @property
     def _has_direct(self) -> bool:
@@ -1412,6 +1434,35 @@ class FoodstuffsScraper:
 
         return products, did_paginate
 
+    async def _direct_post(self, url: str, headers: dict, data: dict, attempts: int = 4):
+        """Direct api-prod POST via a proxy-less httpx client (fast, this host's own IP).
+
+        api-prod is API-key/Bearer-gated, NOT Cloudflare-challenged, so these POSTs go
+        DIRECT — no browser, no proxy/tunnel. Only the CF-gated work (template capture,
+        token refresh) still rides the (proxied) browser. Returns a _DirectResp exposing
+        .status/.ok/await .json() so the existing callers are unchanged.
+        """
+        if self._direct_client is None:
+            self._direct_client = httpx.AsyncClient(
+                http2=False,  # match the browser (launched with --disable-http2)
+                follow_redirects=True,
+                timeout=httpx.Timeout(30.0, connect=15.0),
+            )
+        # Strip headers httpx must own, plus stale cookie/tracing from the captured browser
+        # request. api-prod needs only the Authorization Bearer + API key, which we keep.
+        _skip = {"content-length", "host", "connection", "accept-encoding",
+                 "cookie", "traceparent", "tracestate", "newrelic"}
+        send = {k: v for k, v in headers.items() if k.lower() not in _skip}
+        payload = json.dumps(data).encode()
+        resp = None
+        for i in range(attempts):
+            resp = await self._direct_client.post(url, headers=send, content=payload)
+            if resp.status_code != 425:
+                break
+            logger.warning(f"  [425] Too Early on {url} — retry {i + 1}/{attempts}")
+            await asyncio.sleep(0.4 * (i + 1))
+        return _DirectResp(resp)
+
     async def _post_with_425_retry(self, url: str, headers: dict, data: dict, attempts: int = 4):
         """POST that retries HTTP 425 'Too Early'.
 
@@ -1520,14 +1571,14 @@ class FoodstuffsScraper:
         try:
             if self._rate_limiter:
                 await self._rate_limiter.acquire()
-            resp = await self._post_with_425_retry(
+            resp = await self._direct_post(
                 self._direct_url, self._direct_headers, body
             )
             if resp.status in (401, 403):
                 # Token expired. Re-mint the Bearer via the captured token request and retry ONCE.
                 # The per-category bodies are NOT deleted.
                 if await self._refresh_token():
-                    resp = await self._post_with_425_retry(
+                    resp = await self._direct_post(
                         self._direct_url, self._direct_headers, body
                     )
             if not resp.ok:
@@ -1552,7 +1603,7 @@ class FoodstuffsScraper:
             try:
                 if self._rate_limiter:
                     await self._rate_limiter.acquire()
-                r2 = await self._post_with_425_retry(
+                r2 = await self._direct_post(
                     self._direct_url, self._direct_headers, pb
                 )
                 if r2.ok:
@@ -1563,7 +1614,7 @@ class FoodstuffsScraper:
             except Exception as e:
                 logger.warning(f"  [direct] page {page_num}: {e} — stopping")
                 break
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.1)  # api-prod not CF-gated; global rate limiter is the real governor
 
         products: list[ScrapedProduct] = []
         seen_ids: set[str] = set()
@@ -1664,7 +1715,7 @@ class FoodstuffsScraper:
         try:
             if self._rate_limiter:
                 await self._rate_limiter.acquire()
-            resp = await self._post_with_425_retry(self._direct_url, self._direct_headers, body)
+            resp = await self._direct_post(self._direct_url, self._direct_headers, body)
             if not resp.ok:
                 return []
             rj = await resp.json()
@@ -1680,7 +1731,7 @@ class FoodstuffsScraper:
             try:
                 if self._rate_limiter:
                     await self._rate_limiter.acquire()
-                r2 = await self._post_with_425_retry(self._direct_url, self._direct_headers, pb)
+                r2 = await self._direct_post(self._direct_url, self._direct_headers, pb)
                 if r2.ok:
                     all_responses.append(await r2.json())
                 else:
@@ -1689,7 +1740,7 @@ class FoodstuffsScraper:
             except Exception as e:
                 logger.warning(f"  [direct] {facet_field}={facet_value} page {page_num}/{total_pages}: {e} — truncating bucket here")
                 break
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.1)  # api-prod not CF-gated; global rate limiter is the real governor
 
         products: list[ScrapedProduct] = []
         seen_here: set[str] = set()
@@ -2357,6 +2408,12 @@ class FoodstuffsScraper:
             await loop.run_in_executor(None, lambda: self._end_run(run_id, "failed", stats, error=str(e)))
             raise
         finally:
+            if self._direct_client is not None:
+                try:
+                    await self._direct_client.aclose()
+                except Exception:
+                    pass
+                self._direct_client = None
             if self._shared_browser:
                 # Shared browser: only close this worker's context, not the browser
                 if self._page:
