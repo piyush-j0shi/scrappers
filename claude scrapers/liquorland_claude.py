@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from jsonl_export import write_jsonl, to_cents, clean_record
+from liquor_common import parse_qty_size, classify_type
 
 BASE = "https://www.liquorland.co.nz"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -44,12 +45,36 @@ DEFAULT_CATEGORIES = ["beer", "wine", "spirits", "rtd", "cider"]
 # ~99999.99 (with a few $100k+ variants); everything real is far below this.
 PRICE_SENTINEL = 99999.0
 
+# Liquorland's fortnightly specials live in the "digital mailer", a third-party
+# Salefinder catalogue (embed.salefinder.co.nz, retailer 73). It is a single
+# NATIONAL catalogue — there is no per-branch version — so we fetch it once and
+# flag only the products THIS branch actually stocks (matched by URL/barcode).
+# The catalogue's saleId rotates each fortnight, so we discover it dynamically.
+SALEFINDER_HOST = "https://embed.salefinder.co.nz"
+SALEFINDER_RETAILER = 73
+SALEFINDER_LOCATION = 13  # embed default; catalogue content is location-agnostic
+
+_LL_HOST_RE = re.compile(r"^https?://(?:www\.)?liquorland\.co\.nz/", re.I)
+_BARCODE_TAIL_RE = re.compile(r"-(\d{6,14})$")
+
 
 def _is_real_price(v: str) -> bool:
     try:
         return float(v) < PRICE_SENTINEL
     except (TypeError, ValueError):
         return False
+
+
+def _ll_slug(url: Optional[str]) -> str:
+    """Normalise a Liquorland product URL to a bare slug for special-matching."""
+    return _LL_HOST_RE.sub("", (url or "")).strip("/").lower()
+
+
+def _to_float(v) -> Optional[float]:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 class LiquorlandScraper:
@@ -101,6 +126,79 @@ class LiquorlandScraper:
         if not any(c.name == "preferredstoreid" for c in self.jar):
             raise RuntimeError("preferred-store cookie was not set")
         print(f"bound store: {self.store_label}")
+
+    # ---- specials (digital mailer / Salefinder) -------------------------------
+    def _get_jsonp(self, url: str) -> dict:
+        """GET a Salefinder JSONP endpoint (Referer must be liquorland) and strip
+        the `(...)` / `cb(...)` wrapper, returning the decoded JSON object."""
+        req = urllib.request.Request(url, headers={
+            "User-Agent": UA, "Accept": "application/json, text/javascript, */*",
+            "Referer": BASE + "/", "X-Requested-With": "XMLHttpRequest"})
+        with self.opener.open(req, timeout=30) as r:
+            body = r.read().decode("utf-8", "replace").strip()
+        m = re.match(r"^[A-Za-z0-9_.$]*\((.*)\)\s*;?\s*$", body, re.S)
+        return json.loads(m.group(1) if m else body)
+
+    def _current_sale_id(self) -> Optional[str]:
+        """Discover the live catalogue's saleId (it rotates each fortnight)."""
+        try:
+            d = self._get_jsonp(f"{SALEFINDER_HOST}/catalogues/view/"
+                                f"{SALEFINDER_RETAILER}/?format=json&saleGroup=0")
+        except Exception as exc:
+            print(f"  [specials] catalogue list failed: {exc}", file=sys.stderr)
+            return None
+        m = re.search(r"saleId=(\d+)", d.get("content", ""))
+        return m.group(1) if m else None
+
+    def fetch_specials(self) -> dict:
+        """Return {slug/barcode -> promo dict} for the current mailer catalogue.
+
+        Each promo dict carries the advertised (special) price, catalogue page,
+        and the sale's name + start/end dates. Keyed by BOTH the normalised
+        product slug and the barcode in the URL tail so callers can match either.
+        Returns {} on any failure so the scrape still completes without specials.
+        """
+        sale_id = self._current_sale_id()
+        if not sale_id:
+            return {}
+        url = (f"{SALEFINDER_HOST}/catalogue/svgData/{sale_id}/?format=json"
+               f"&pagetype=catalogue2&retailerId={SALEFINDER_RETAILER}"
+               f"&saleGroup=0&locationId={SALEFINDER_LOCATION}")
+        try:
+            data = self._get_jsonp(url)
+        except Exception as exc:
+            print(f"  [specials] svgData failed: {exc}", file=sys.stderr)
+            return {}
+        sale_name = data.get("saleName") or "Specials"
+        starts = (data.get("startDate") or "")[:10] or None
+        ends = (data.get("endDate") or "")[:10] or None
+        out: dict[str, dict] = {}
+        tiles = 0
+        for page in data.get("catalogue") or []:
+            if not isinstance(page, dict):
+                continue
+            page_no = page.get("pageNo")
+            for v in page.values():
+                if not (isinstance(v, dict) and v.get("itemId") and v.get("itemName")):
+                    continue
+                tiles += 1
+                promo = {
+                    "special_price_cents": to_cents(_to_float(v.get("lowestPrice"))),
+                    "promo_text": sale_name,
+                    "promo_starts_at": starts,
+                    "promo_ends_at": ends,
+                    "source_promotion_id": sale_id,
+                    "catalogue_page": page_no,
+                }
+                slug = _ll_slug(v.get("href"))
+                if slug:
+                    out.setdefault(slug, promo)
+                bc = _BARCODE_TAIL_RE.search(slug or "")
+                if bc:
+                    out.setdefault(bc.group(1), promo)
+        print(f"  [specials] '{sale_name}' {starts}..{ends}: {tiles} tiles "
+              f"(saleId {sale_id})")
+        return out
 
     # ---- parsing --------------------------------------------------------------
     _LD = re.compile(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', re.S)
@@ -187,12 +285,17 @@ class LiquorlandScraper:
                 base_cents = (to_cents(float(base))
                               if on_special and base and base != unit
                               and _is_real_price(base) else None)
+                # Split quantity + size from the name (variant.size is a pack
+                # descriptor like "15Pk"; the ml is only in the product name).
+                qty, size = parse_qty_size(prod["name"], extra.get("size") or "")
                 out.append({
                     "source_product_id": (extra.get("barcode")
                                           or (slug or "").rsplit("-", 1)[-1] or slug),
                     "barcode": extra.get("barcode"),
                     "raw_name": prod["name"],
-                    "size": extra.get("size"),
+                    "type": classify_type(None, prod["name"], size),
+                    "quantity": qty,
+                    "size": size,
                     "category_path": cat,
                     "current_price_cents": unit_cents,
                     # everyday price when it differs from the on-special price
@@ -208,6 +311,33 @@ class LiquorlandScraper:
                 time.sleep(0.3)
         return out
 
+    def _apply_specials(self, rows: list[dict]) -> int:
+        """Flag rows that appear in the current mailer catalogue as on-special.
+        Only STOCKED rows (with a price) are flagged, so the national catalogue is
+        narrowed to this branch's actual specials. Returns the count flagged."""
+        promos = self.fetch_specials()
+        if not promos:
+            return 0
+        flagged = 0
+        for r in rows:
+            if not r.get("current_price_cents"):
+                continue  # not stocked/priced at this branch — skip
+            promo = promos.get(_ll_slug(r.get("product_url")))
+            if not promo and r.get("barcode"):
+                promo = promos.get(r["barcode"])
+            if not promo:
+                continue
+            r["promo_type"] = "special"
+            r["special"] = True
+            r["discount"] = True
+            r["promo_text"] = promo["promo_text"]
+            r["promo_starts_at"] = promo["promo_starts_at"]
+            r["promo_ends_at"] = promo["promo_ends_at"]
+            r["source_promotion_id"] = promo["source_promotion_id"]
+            r["catalogue_page"] = promo["catalogue_page"]
+            flagged += 1
+        return flagged
+
     def run(self) -> None:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         by_id: dict[str, dict] = {}
@@ -215,8 +345,11 @@ class LiquorlandScraper:
             for r in self._crawl_category(cat, now):
                 key = r["source_product_id"] or r["product_url"]
                 by_id.setdefault(key, r)
-        records = [clean_record(r) for r in by_id.values()]
-        specials = sum(1 for r in records if r.get("promo_type"))
+        rows = list(by_id.values())
+        flagged = self._apply_specials(rows)
+        print(f"  [specials] flagged {flagged} branch-stocked products on special")
+        records = [clean_record(r) for r in rows]
+        specials = sum(1 for r in records if r.get("special"))
         path = write_jsonl("liquorland", self.store_label, records)
         print(f"\n{self.store_label}: {len(records)} products "
               f"({specials} on special) -> {path}")
