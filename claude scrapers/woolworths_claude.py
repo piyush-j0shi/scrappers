@@ -458,11 +458,12 @@ class WoolworthsClaudeScraper:
         auto_bootstrap: bool = True,
         max_session_age_min: int = DEFAULT_MAX_SESSION_AGE_MIN,
     ) -> None:
-        if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-            raise RuntimeError(
-                f"Missing SUPABASE_URL / SUPABASE_SERVICE_KEY in {ENV_PATH}"
-            )
-        self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        if not os.environ.get("DATABASE_URL"):
+            raise RuntimeError(f"Missing DATABASE_URL in {ENV_PATH}")
+        # The dedicated store_chains/store_branches project was retired; branch
+        # resolution now reads pico-prod's catalog schema over DATABASE_URL
+        # (see catalog_branches.py / _resolve_branch). No operational Supabase.
+        self.supabase = None
         self.branch_name = branch_name
         self.branch_id = branch_id  # filled in by _resolve_branch if not provided
         self.chain_id: Optional[str] = None
@@ -576,7 +577,7 @@ class WoolworthsClaudeScraper:
         if not script_path.exists():
             logger.warning(f"  [bootstrap] {script_path} not found, skipping refresh")
             return False
-        cmd = ["python3", str(script_path), "--branch-id", self.branch_id]
+        cmd = [sys.executable, str(script_path), "--branch-id", self.branch_id]
         logger.info(f"  [bootstrap] refreshing session for branch {self.branch_id}...")
         try:
             r = subprocess.run(
@@ -631,70 +632,24 @@ class WoolworthsClaudeScraper:
         return True
 
     def _resolve_branch(self) -> None:
-        """READ-ONLY: look up chain_id / branch_id from store_chains / store_branches.
-        The scraper must not WRITE — chain/branch creation is the importer's job.
-        Create-if-missing upserts are commented out below."""
-        chain = (
-            self.supabase.table("store_chains")
-            .select("id")
-            .eq("slug", WOOLWORTHS_CHAIN_SLUG)
-            .execute()
-            .data
-        )
-        if not chain:
-            # DATABASE WRITE DISABLED — do not create the chain row from the scraper.
-            # chain = (
-            #     self.supabase.table("store_chains")
-            #     .upsert({"slug": WOOLWORTHS_CHAIN_SLUG, "name": "Woolworths"}, on_conflict="slug")
-            #     .execute()
-            #     .data
-            # )
+        """READ-ONLY: resolve branch id/name from pico-prod's catalog schema
+        (catalog.branches over DATABASE_URL) — the single source of truth since
+        the dedicated store_branches project was retired. Woolworths pins the
+        store via its saved browser session, so it needs only id + name here.
+        Never writes; the importer owns all catalog writes."""
+        from catalog_branches import get_branch
+        b = get_branch(WOOLWORTHS_CHAIN_SLUG, branch_id=self.branch_id,
+                       name=self.branch_name)
+        if not b:
+            who = f"id={self.branch_id}" if self.branch_id else f"name={self.branch_name!r}"
             logger.error(
-                f"store_chains row missing for slug={WOOLWORTHS_CHAIN_SLUG} — "
-                f"cannot resolve chain (scraper no longer creates it). Aborting branch."
+                f"catalog.branches has no match for {who} "
+                f"(retailer {WOOLWORTHS_CHAIN_SLUG}) — branch unresolved, will be skipped."
             )
             return
-        self.chain_id = chain[0]["id"]
-
-        if self.branch_id:
-            r = (
-                self.supabase.table("store_branches")
-                .select("id,name")
-                .eq("id", self.branch_id)
-                .execute()
-                .data
-            )
-            if r:
-                self.branch_name = r[0]["name"]
-            return
-
-        r = (
-            self.supabase.table("store_branches")
-            .select("id,name")
-            .eq("chain_id", self.chain_id)
-            .eq("name", self.branch_name)
-            .execute()
-            .data
-        )
-        if r:
-            self.branch_id = r[0]["id"]
-            return
-
-        # DATABASE WRITE DISABLED — do not create the branch row from the scraper.
-        # r = (
-        #     self.supabase.table("store_branches")
-        #     .upsert(
-        #         {"chain_id": self.chain_id, "name": self.branch_name},
-        #         on_conflict="chain_id,name",
-        #     )
-        #     .execute()
-        #     .data
-        # )
-        # self.branch_id = r[0]["id"]
-        logger.error(
-            f"store_branches row missing for {self.branch_name!r} (chain {self.chain_id}) — "
-            f"scraper no longer creates it; branch unresolved, will be skipped."
-        )
+        self.branch_id = b["id"]
+        self.branch_name = b["name"]
+        self.chain_id = b.get("retailer_id")
 
     # ---- Network capture -------------------------------------------------
 
@@ -1881,6 +1836,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--branch-id", default=None, help="Branch UUID (overrides --branch)")
     ap.add_argument("--all-branches", action="store_true",
                     help="Loop every Woolworths branch with a saved session")
+    ap.add_argument("--list-branches", action="store_true",
+                    help="Resolve branches from catalog and print them, then exit (no scraping)")
     ap.add_argument("--categories", default=None,
                     help="Comma-separated list of slugs (e.g. fruit-veg,bakery). Default = all categories.")
     ap.add_argument("--test", action="store_true",
@@ -1939,44 +1896,32 @@ async def main_async() -> int:
             return 2
         logger.info(f"loaded {len(proxy_pool)} proxies from {args.proxy_file}")
 
-    sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    # Quick, no-scrape sanity check: resolve branches from catalog and exit.
+    if getattr(args, "list_branches", False):
+        from catalog_branches import list_branches
+        all_branches = list_branches(WOOLWORTHS_CHAIN_SLUG, active_only=True)
+        session_uuids = {p.stem for p in SESSIONS_DIR.glob("*.json")}
+        withsess = [b for b in all_branches if b["id"] in session_uuids]
+        print(f"Woolworths: {len(all_branches)} active branches in catalog, "
+              f"{len(withsess)} with a saved session")
+        for b in all_branches[:10]:
+            marker = "  [session]" if b["id"] in session_uuids else ""
+            print(f"  {b['name']}  id={b['id']}{marker}")
+        if len(all_branches) > 10:
+            print(f"  ... and {len(all_branches) - 10} more")
+        return 0
 
     branches: list[dict] = []
     if args.all_branches:
-        chain = sb.table("store_chains").select("id").eq("slug", WOOLWORTHS_CHAIN_SLUG).execute().data
-        if not chain:
-            logger.error("no Woolworths chain row")
-            return 1
-        all_branches = (
-            sb.table("store_branches")
-            .select("id,name").eq("chain_id", chain[0]["id"]).execute().data
-        )
+        from catalog_branches import list_branches
+        all_branches = list_branches(WOOLWORTHS_CHAIN_SLUG, active_only=True)
         session_uuids = {p.stem for p in SESSIONS_DIR.glob("*.json")}
         branches = [b for b in all_branches if b["id"] in session_uuids]
         logger.info(f"--all-branches: {len(branches)} branches with saved sessions")
-
-        # Skip branches that already completed successfully in the last N hours
+        # NOTE: --skip-recently-done relied on the retired scraper_runs table, so it
+        # is now a no-op (the orchestrator tracks per-branch completion in its logs).
         if args.skip_recently_done > 0:
-            from datetime import timedelta
-            cutoff = (datetime.now(timezone.utc) - timedelta(hours=args.skip_recently_done)).isoformat()
-            try:
-                done_rows = (
-                    sb.table("scraper_runs")
-                    .select("branch_id")
-                    .eq("chain_id", chain[0]["id"])
-                    .eq("status", "success")
-                    .gte("started_at", cutoff)
-                    .execute().data
-                )
-                done_ids = {r["branch_id"] for r in done_rows if r.get("branch_id")}
-                pre = len(branches)
-                branches = [b for b in branches if b["id"] not in done_ids]
-                logger.info(
-                    f"--skip-recently-done {args.skip_recently_done}h: filtered out "
-                    f"{pre - len(branches)} branches (was {pre}, now {len(branches)})"
-                )
-            except Exception as e:
-                logger.warning(f"skip-recently-done query failed: {e}")
+            logger.warning("--skip-recently-done: scraper_runs was retired — option ignored.")
     else:
         if args.branch_id:
             branches = [{"id": args.branch_id, "name": None}]

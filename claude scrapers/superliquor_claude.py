@@ -172,17 +172,52 @@ class SuperLiquorScraper:
               f"({specials} on special) -> {path}")
 
 
+# Branch registry: short key -> store subdomain. --branch selects one; omitting
+# it scrapes them ALL. Each Super Liquor store is its own subdomain and renders
+# that branch's prices + Super Specials inline.
+BRANCHES: dict[str, str] = {
+    "hobsonville": "hobsonville",
+}
+
+
+def _norm_branch(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (key or "").lower()).strip("-")
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Super Liquor single-branch scraper")
-    p.add_argument("--store", default="hobsonville",
-                   help="store subdomain, e.g. hobsonville (default) -> "
-                        "https://hobsonville.superliquor.co.nz")
+    p = argparse.ArgumentParser(description="Super Liquor branch scraper")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--branch", help="branch key: " + ", ".join(BRANCHES)
+                   + " (omit to scrape ALL of them)")
+    g.add_argument("--store", help="ad-hoc store subdomain, e.g. hobsonville")
     p.add_argument("--categories", default=",".join(DEFAULT_CATEGORIES),
                    help="comma-separated category slugs to crawl")
     args = p.parse_args(argv)
     cats = [c.strip() for c in args.categories.split(",") if c.strip()]
-    SuperLiquorScraper(args.store, cats).run()
+
+    # Ad-hoc single store by subdomain (unchanged behaviour).
+    if args.store:
+        SuperLiquorScraper(args.store, cats).run()
+        return 0
+
+    if args.branch:
+        key = _norm_branch(args.branch)
+        if key not in BRANCHES:
+            print(f"error: unknown branch {args.branch!r}; choose from: "
+                  f"{', '.join(BRANCHES)}", file=sys.stderr)
+            return 2
+        targets = [key]
+    else:
+        targets = list(BRANCHES)
+        print(f"no --branch given -> scraping all {len(targets)} Super Liquor "
+              f"branch(es): {', '.join(targets)}")
+
+    for key in targets:
+        sub = BRANCHES[key]
+        print(f"\n=== Super Liquor {key.replace('-', ' ').title()} ({sub}) ===")
+        SuperLiquorScraper(sub, cats).run()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

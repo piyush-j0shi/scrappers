@@ -355,24 +355,61 @@ class LiquorlandScraper:
               f"({specials} on special) -> {path}")
 
 
+# Branch registry: short key -> (Liquorland storeid, canonical label). --branch
+# selects one; omitting --branch scrapes them ALL. Store ids verified against
+# /api/stores/<query> (2026-08-05). Specials are ONE national catalogue, so each
+# branch flags only the products it actually stocks (see _apply_specials).
+BRANCHES: dict[str, tuple[int, str]] = {
+    "hobsonville":  (48, "Liquorland Hobsonville"),
+    "albany":       (28, "Liquorland Albany"),
+    "west-harbour": (41, "Liquorland West Harbour"),
+    "glenfield":    (47, "Liquorland Glenfield"),
+}
+
+
+def _norm_branch(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (key or "").lower()).strip("-")
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Liquorland single-branch scraper")
+    p = argparse.ArgumentParser(description="Liquorland branch scraper")
     g = p.add_mutually_exclusive_group()
-    g.add_argument("--storeid", type=int, help="preferred store id (e.g. 48 = Hobsonville)")
-    g.add_argument("--store-query", help="resolve store id by name, e.g. hobsonville")
+    g.add_argument("--branch", help="branch key: " + ", ".join(BRANCHES)
+                   + " (omit to scrape ALL of them)")
+    g.add_argument("--storeid", type=int, help="ad-hoc preferred store id (e.g. 48)")
+    g.add_argument("--store-query", help="ad-hoc: resolve store id by name, e.g. hobsonville")
     p.add_argument("--categories", default=",".join(DEFAULT_CATEGORIES),
                    help="comma-separated category slugs")
     args = p.parse_args(argv)
     cats = [c.strip() for c in args.categories.split(",") if c.strip()]
-    s = LiquorlandScraper(cats)
-    storeid = args.storeid
-    if storeid is None and args.store_query:
-        storeid = s.resolve_store(args.store_query)
-    if storeid is None:
-        print("error: pass --storeid or --store-query", file=sys.stderr)
-        return 2
-    s.set_store(storeid)
-    s.run()
+
+    # Ad-hoc single store by id / name (unchanged behaviour).
+    if args.storeid is not None or args.store_query:
+        s = LiquorlandScraper(cats)
+        storeid = args.storeid if args.storeid is not None else s.resolve_store(args.store_query)
+        s.set_store(storeid)
+        s.run()
+        return 0
+
+    # Registry-driven: one branch (--branch) or all of them (default).
+    if args.branch:
+        key = _norm_branch(args.branch)
+        if key not in BRANCHES:
+            print(f"error: unknown branch {args.branch!r}; choose from: "
+                  f"{', '.join(BRANCHES)}", file=sys.stderr)
+            return 2
+        targets = [key]
+    else:
+        targets = list(BRANCHES)
+        print(f"no --branch given -> scraping all {len(targets)} Liquorland branches: "
+              f"{', '.join(targets)}")
+
+    for key in targets:
+        storeid, label = BRANCHES[key]
+        print(f"\n=== {label} (storeid {storeid}) ===")
+        s = LiquorlandScraper(cats)
+        s.set_store(storeid)
+        s.run()
     return 0
 
 

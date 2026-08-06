@@ -1,8 +1,9 @@
-"""The Bottle-O GLENFIELD branch scraper (rich) — Stage 1 of the pipeline.
+"""The Bottle-O branch scraper (rich, multi-branch) — Stage 1 of the pipeline.
 
-Unlike thebottleo_claude.py (which scraped the national thebottleo.co.nz shop,
-only 399 products), this targets the BRANCH webshop
-`https://glenfield.shop.thebottleo.co.nz` (~2,600 products, real branch pricing).
+Targets each store's BRANCH webshop `https://<key>.shop.thebottleo.co.nz`
+(~2,600 products, real branch pricing) — currently Glenfield + Schnapper Rock
+(see BRANCHES). `--branch <key>` scrapes one; omitting it scrapes them all.
+(The retired national thebottleo.co.nz shop scraper only had 399 products.)
 
 Two-pass, because the branch listing pages carry only name/price/image/url and
 there is NO bulk API/feed (verified): everything else lives on each product's
@@ -26,9 +27,9 @@ Writes a JSONL of rich records via jsonl_export.write_jsonl; build the Excel wit
 build_bottleo_glenfield_xlsx.py.
 
 Usage:
-    python thebottleo_glenfield_claude.py                 # full run
-    python thebottleo_glenfield_claude.py --limit 40      # quick test
-    python thebottleo_glenfield_claude.py --workers 8
+    python thebottleo_claude.py                          # all branches
+    python thebottleo_claude.py --branch schnapper-rock  # one branch
+    python thebottleo_claude.py --branch glenfield --limit 40   # quick test
 """
 from __future__ import annotations
 
@@ -46,11 +47,33 @@ from typing import Optional
 from jsonl_export import write_jsonl, to_cents, clean_record
 from liquor_common import parse_qty_size, classify_type
 
+# Branch registry: short key -> canonical label. Host is always
+# {key}.shop.thebottleo.co.nz. --branch selects one; omitting it scrapes them
+# ALL. The module is function-based and runs ONE branch at a time (sequentially),
+# so _set_branch() just points the module-level HOST/BASE/BRANCH_NAME at the
+# current branch before each run().
+BRANCHES: dict[str, str] = {
+    "glenfield":      "The Bottle-O Glenfield",
+    "schnapper-rock": "The Bottle-O Schnapper Rock",
+}
 HOST = "glenfield.shop.thebottleo.co.nz"
 BASE = f"https://{HOST}"
-BRANCH_NAME = "The Bottle-O Glenfield"
+BRANCH_NAME = BRANCHES["glenfield"]
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+
+def _norm_branch(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (key or "").lower()).strip("-")
+
+
+def _set_branch(key: str) -> str:
+    """Point the module-level HOST/BASE/BRANCH_NAME at one branch before run()."""
+    global HOST, BASE, BRANCH_NAME
+    HOST = f"{key}.shop.thebottleo.co.nz"
+    BASE = f"https://{HOST}"
+    BRANCH_NAME = BRANCHES[key]
+    return BRANCH_NAME
 
 _TALKER = 'class="TalkerGrid__Item"'
 _MULTIBUY = re.compile(r'(\d+)\s*for\s*\$?\s*([0-9]+(?:\.[0-9]{2})?)', re.I)
@@ -385,20 +408,39 @@ def run(limit: Optional[int], workers: int, enum_pages: Optional[int] = None) ->
     specials = sum(1 for r in records if r.get("special"))
     disc = sum(1 for r in records if r.get("discount"))
     withabv = sum(1 for r in records if r.get("abv"))
-    path = write_jsonl("thebottleo_glenfield", BRANCH_NAME, records)
+    path = write_jsonl("thebottleo", BRANCH_NAME, records)
     print(f"\n{BRANCH_NAME}: {len(records)} products "
           f"(details ok {ok}, priced {priced}, special {specials}, discount {disc}, "
           f"abv {withabv}) -> {path}")
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="The Bottle-O Glenfield branch scraper")
+    p = argparse.ArgumentParser(description="The Bottle-O branch scraper")
+    p.add_argument("--branch", help="branch key: " + ", ".join(BRANCHES)
+                   + " (omit to scrape ALL of them)")
     p.add_argument("--limit", type=int, default=None, help="cap #products (testing)")
     p.add_argument("--workers", type=int, default=8, help="concurrent detail fetches")
     p.add_argument("--enum-pages", type=int, default=None, help="cap enumeration pages (testing)")
     args = p.parse_args(argv)
-    run(args.limit, args.workers, args.enum_pages)
+
+    if args.branch:
+        key = _norm_branch(args.branch)
+        if key not in BRANCHES:
+            print(f"error: unknown branch {args.branch!r}; choose from: "
+                  f"{', '.join(BRANCHES)}", file=sys.stderr)
+            return 2
+        targets = [key]
+    else:
+        targets = list(BRANCHES)
+        print(f"no --branch given -> scraping all {len(targets)} Bottle-O branches: "
+              f"{', '.join(targets)}")
+
+    for key in targets:
+        label = _set_branch(key)
+        print(f"\n=== {label} ({BASE}) ===", flush=True)
+        run(args.limit, args.workers, args.enum_pages)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -53,11 +53,48 @@ from pathlib import Path
 from typing import Optional
 
 from playwright.async_api import async_playwright, BrowserContext, Page
-from supabase import create_client, Client
 
-# Import stealth constants from base_scraper — never modify base_scraper itself.
-from base_scraper import USER_AGENT, EXTRA_HEADERS, STEALTH_SCRIPT
-from config import SUPABASE_URL, SUPABASE_SERVICE_KEY
+# Stealth constants. base_scraper.py + config.py were removed from the repo in the
+# "cleanup" commit (31212b4); these are the same values woolworths_claude.py uses.
+# Kept inline so the bootstrap is self-contained — no dead deps, and no Supabase
+# creds (branch resolution now comes from pico-prod's catalog via catalog_branches).
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+EXTRA_HEADERS = {
+    "Accept-Language": "en-NZ,en-GB;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Upgrade-Insecure-Requests": "1",
+}
+STEALTH_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'plugins', {
+    get: () => {
+        const arr = [
+            { filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { filename: 'internal-nacl-plugin', description: 'Native Client' },
+        ];
+        arr.item = (i) => arr[i];
+        arr.namedItem = (n) => arr.find(p => p.filename === n);
+        return arr;
+    },
+});
+Object.defineProperty(navigator, 'languages', { get: () => ['en-NZ', 'en-GB', 'en'] });
+if (!window.chrome) window.chrome = {};
+if (!window.chrome.runtime) window.chrome.runtime = {};
+window.chrome.loadTimes = function() { return {}; };
+window.chrome.csi = function() { return {}; };
+const _origPermQuery = navigator.permissions.query.bind(navigator.permissions);
+navigator.permissions.query = (params) =>
+    params.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : _origPermQuery(params);
+"""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,30 +157,30 @@ async def _update_index(branch_id: str, entry: dict) -> None:
 # Supabase access
 # ---------------------------------------------------------------------------
 
-def fetch_branches(supabase: Client, branch_id: Optional[str] = None) -> list[Branch]:
-    chain = (
-        supabase.table("store_chains").select("id").eq("slug", "woolworths").limit(1).execute()
-    )
-    if not chain.data:
-        raise RuntimeError("No Woolworths chain row found in store_chains")
-    chain_id = chain.data[0]["id"]
+def fetch_branches(branch_id: Optional[str] = None) -> list[Branch]:
+    """Branch list from pico-prod's `catalog` schema (the dedicated store_branches
+    project was retired). `api_store_id` here is the WW `addressId` — the catalog
+    `woolworths_store_id` external id. Session files are keyed by catalog branch id,
+    which is also the join key the scraper's --all-branches uses."""
+    import sys
+    scrapers_dir = str(Path(__file__).resolve().parent / "claude scrapers")
+    if scrapers_dir not in sys.path:
+        sys.path.insert(0, scrapers_dir)
+    from catalog_branches import list_branches, get_branch
 
-    q = (
-        supabase.table("store_branches")
-        .select("id,name,api_store_id")
-        .eq("chain_id", chain_id)
-        .not_.is_("api_store_id", "null")
-    )
     if branch_id:
-        q = q.eq("id", branch_id)
-    rows = q.execute().data or []
+        b = get_branch("woolworths", branch_id=branch_id)
+        rows = [b] if b else []
+    else:
+        rows = list_branches("woolworths", active_only=True, require_store_id=True)
 
     branches: list[Branch] = []
     for r in rows:
+        sid = r.get("api_store_id")
         try:
-            branches.append(Branch(id=r["id"], name=r["name"], api_store_id=int(r["api_store_id"])))
+            branches.append(Branch(id=r["id"], name=r["name"], api_store_id=int(sid)))
         except (TypeError, ValueError):
-            logger.warning(f"Skipping branch {r.get('id')} — api_store_id not int: {r.get('api_store_id')!r}")
+            logger.warning(f"Skipping branch {r.get('id')} — woolworths_store_id not int: {sid!r}")
     return branches
 
 
@@ -409,8 +446,7 @@ def _is_fresh(branch_id: str, index: dict) -> bool:
 
 async def run(workers: int, branch_id: Optional[str], skip_existing: bool) -> int:
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    branches = fetch_branches(supabase, branch_id)
+    branches = fetch_branches(branch_id)
     if not branches:
         logger.error("No Woolworths branches with api_store_id found — nothing to do")
         return 1

@@ -1007,14 +1007,17 @@ class FoodstuffsScraper:
         rate_limiter: Optional[TokenBucketLimiter] = None,
         template_state: Optional[TemplateState] = None,
     ) -> None:
-        if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-            raise RuntimeError(f"Missing Supabase env in {ENV_PATH}")
+        if not os.environ.get("DATABASE_URL"):
+            raise RuntimeError(f"Missing DATABASE_URL in {ENV_PATH}")
         if chain_key not in CHAINS:
             raise ValueError(f"Unknown chain: {chain_key}")
 
         self.chain_key = chain_key
         self.cfg = CHAINS[chain_key]
-        self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        # The dedicated store_chains/store_branches project was retired; branch
+        # resolution now reads pico-prod's catalog schema over DATABASE_URL
+        # (see catalog_branches.py / _resolve_branch). No operational Supabase.
+        self.supabase = None
         self.branch_name = branch_name or self.cfg["default_branch"]
         self.branch_id = branch_id
         self.api_store_id: Optional[str] = None
@@ -1160,54 +1163,25 @@ class FoodstuffsScraper:
     # ---- Branch resolution ----------------------------------------------
 
     def _resolve_branch(self) -> None:
-        # READ-ONLY resolution: the scraper looks up chain/branch + api_store_id to
-        # know which store to scrape, but must not WRITE. Chain/branch creation is
-        # the importer's job. Create-if-missing upserts are commented out below.
-        chain = (
-            self.supabase.table("store_chains")
-            .select("id").eq("slug", self.cfg["slug"]).execute().data
-        )
-        if not chain:
-            # DATABASE WRITE DISABLED — do not create the chain row from the scraper.
-            # chain = (
-            #     self.supabase.table("store_chains")
-            #     .upsert({"slug": self.cfg["slug"], "name": self.cfg["name"]}, on_conflict="slug")
-            #     .execute().data
-            # )
+        # READ-ONLY resolution against pico-prod's catalog schema — the single
+        # source of truth since the dedicated store_branches project was retired.
+        # Looks up branch id/name + the chain's api_store_id from catalog.branches
+        # + catalog.external_store_ids over DATABASE_URL. Never writes; the
+        # importer owns all catalog writes.
+        from catalog_branches import get_branch
+        b = get_branch(self.cfg["slug"], branch_id=self.branch_id,
+                       name=self.branch_name)
+        if not b:
+            who = f"id={self.branch_id}" if self.branch_id else f"name={self.branch_name!r}"
             logger.error(
-                f"store_chains row missing for slug={self.cfg['slug']} — "
-                f"cannot resolve chain (scraper no longer creates it). Aborting branch."
+                f"catalog.branches has no match for {who} "
+                f"(retailer {self.cfg['slug']}) — branch unresolved, will be skipped."
             )
             return
-        self.chain_id = chain[0]["id"]
-
-        if self.branch_id:
-            r = (self.supabase.table("store_branches")
-                 .select("id,name,api_store_id").eq("id", self.branch_id).execute().data)
-            if r:
-                self.branch_name = r[0]["name"]
-                self.api_store_id = r[0].get("api_store_id")
-            return
-
-        r = (self.supabase.table("store_branches")
-             .select("id,name,api_store_id")
-             .eq("chain_id", self.chain_id).eq("name", self.branch_name)
-             .execute().data)
-        if r:
-            self.branch_id = r[0]["id"]
-            self.api_store_id = r[0].get("api_store_id")
-            return
-
-        # DATABASE WRITE DISABLED — do not create the branch row from the scraper.
-        # r = (self.supabase.table("store_branches")
-        #      .upsert({"chain_id": self.chain_id, "name": self.branch_name},
-        #              on_conflict="chain_id,name").execute().data)
-        # self.branch_id = r[0]["id"]
-        # self.api_store_id = r[0].get("api_store_id")
-        logger.error(
-            f"store_branches row missing for {self.branch_name!r} (chain {self.chain_id}) — "
-            f"scraper no longer creates it; branch unresolved, will be skipped."
-        )
+        self.branch_id = b["id"]
+        self.branch_name = b["name"]
+        self.api_store_id = b.get("api_store_id")
+        self.chain_id = b.get("retailer_id")
 
     # ---- Random delay ----------------------------------------------------
 
@@ -2903,7 +2877,9 @@ def parse_args(argv: Optional[list[str]] = None, default_chain: Optional[str] = 
     ap.add_argument("--branch", default=None, help="Branch name (default: chain default)")
     ap.add_argument("--branch-id", default=None, help="Branch UUID overrides --branch")
     ap.add_argument("--all-branches", action="store_true",
-                    help="Loop every branch (uses api_store_id from store_branches)")
+                    help="Loop every branch with an api_store_id (from catalog.branches)")
+    ap.add_argument("--list-branches", action="store_true",
+                    help="Resolve branches from catalog and print them, then exit (no scraping)")
     ap.add_argument("--categories", default=None,
                     help="Comma-separated category slugs (e.g. fruit-and-vegetables,bakery)")
     ap.add_argument("--test", action="store_true",
@@ -2957,9 +2933,19 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
     cats = categories_for(args)
     cache = BarcodeCache()
 
-    sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     cfg = CHAINS[args.chain]
     _setup_file_logging(args.chain)
+
+    # Quick, no-scrape sanity check: resolve branches from catalog and exit.
+    if getattr(args, "list_branches", False):
+        from catalog_branches import list_branches
+        bs = list_branches(cfg["slug"], active_only=True, require_store_id=True)
+        print(f"{cfg['name']}: {len(bs)} branches with api_store_id (catalog.branches)")
+        for b in bs[:10]:
+            print(f"  {b['name']}  id={b['id']}  api_store_id={b['api_store_id']}")
+        if len(bs) > 10:
+            print(f"  ... and {len(bs) - 10} more")
+        return 0
 
     # Only the CapSolver solve needs the tunnel (it's remote and must borrow your home IP).
     # The scrape runs locally — same home IP as the tunnel exit — so it goes direct, avoiding
@@ -2970,12 +2956,8 @@ async def main_async(argv: Optional[list[str]] = None, default_chain: Optional[s
 
     branches: list[dict] = []
     if args.all_branches:
-        chain = sb.table("store_chains").select("id").eq("slug", cfg["slug"]).execute().data
-        if not chain:
-            logger.error(f"no {cfg['name']} chain row"); return 1
-        all_b = (sb.table("store_branches")
-                 .select("id,name,api_store_id").eq("chain_id", chain[0]["id"]).execute().data)
-        branches = [b for b in all_b if b.get("api_store_id")]
+        from catalog_branches import list_branches
+        branches = list_branches(cfg["slug"], active_only=True, require_store_id=True)
         logger.info(f"--all-branches: {len(branches)} branches with api_store_id")
     else:
         branches = [{"id": args.branch_id, "name": args.branch, "api_store_id": None}]
