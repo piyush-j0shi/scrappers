@@ -47,23 +47,20 @@ from typing import Optional
 # for dry-run wiring checks — never send them production data on a live run.
 # ---------------------------------------------------------------------------
 READY: dict[str, dict] = {
-    # our-export-slug -> connector branch
-    "superliquor_super-liquor-hobsonville": {
-        "connector_branch_id": "c4100f84-1c8d-4678-8a7c-7939c7893db4",
-        "connector_code": "super_liquor_nopcommerce",
-        "branch": "Super Liquor Hobsonville",
-    },
-    "thebottleo_the-bottle-o-glenfield": {
-        "connector_branch_id": "7e2f26f6-d8e5-4238-bea7-5dc447dc1732",
-        "connector_code": "bottleo_myfoodlink_branch",
-        "branch": "The Bottle-O Glenfield",
-    },
+    # our-export-slug -> connector branch. IDs from the "Pico B2B Scraper Setup and
+    # Run Checklist" quick-reference (7 Aug 2026); all verified live as active.
+    "liquorland_liquorland-hobsonville":     {"connector_branch_id": "047c3a09-fcc7-43bd-bc14-3433d8a6f288", "connector_code": "liquorland_playwright_catalogue", "branch": "Liquorland Hobsonville"},
+    "liquorland_liquorland-albany":          {"connector_branch_id": "7ea42301-4af1-4658-a911-9f78a0d00409", "connector_code": "liquorland_playwright_catalogue", "branch": "Liquorland Albany"},
+    "liquorland_liquorland-west-harbour":    {"connector_branch_id": "bf098728-7d3e-47df-978d-6228c6ac29de", "connector_code": "liquorland_playwright_catalogue", "branch": "Liquorland West Harbour"},
+    "liquorland_liquorland-glenfield":       {"connector_branch_id": "7a6ffc02-b1f5-44e1-ad94-9b9b00864f32", "connector_code": "liquorland_playwright_catalogue", "branch": "Liquorland Glenfield"},
+    "superliquor_super-liquor-hobsonville":  {"connector_branch_id": "c4100f84-1c8d-4678-8a7c-7939c7893db4", "connector_code": "super_liquor_nopcommerce",       "branch": "Super Liquor Hobsonville"},
+    "thebottleo_the-bottle-o-glenfield":     {"connector_branch_id": "7e2f26f6-d8e5-4238-bea7-5dc447dc1732", "connector_code": "bottleo_myfoodlink_branch",       "branch": "The Bottle-O Glenfield"},
+    "thebottleo_the-bottle-o-schnapper-rock":{"connector_branch_id": "351731d2-4560-4ba4-9f93-cd04a3c76d7a", "connector_code": "bottleo_myfoodlink_branch",       "branch": "The Bottle-O Schnapper Rock"},
+    "newworld_new-world-hobsonville":        {"connector_branch_id": "6a2c6545-d1bc-460e-9251-73dea00eaacd", "connector_code": "newworld_foodstuffs_alcohol",    "branch": "New World Hobsonville (alcohol)"},
+    "woolworths_woolworths-hobsonville":     {"connector_branch_id": "1822fd30-d284-46d1-9bab-cb3a9d2624fb", "connector_code": "woolworths_api_alcohol",         "branch": "Woolworths Hobsonville (alcohol)"},
+    "woolworths_woolworths-glenfield":       {"connector_branch_id": "0d0a6add-c711-4fac-900a-b8846a712d88", "connector_code": "woolworths_api_alcohol",         "branch": "Woolworths Glenfield (alcohol)"},
 }
-BLOCKED = {  # verified=No in the doc — cannot import until Pico activates
-    "liquorland_liquorland-albany", "liquorland_liquorland-hobsonville",
-    "liquorland_liquorland-west-harbour", "liquorland_liquorland-glenfield",
-    "thebottleo_the-bottle-o-schnapper-rock", "thebottleo_the-bottle-o-albany",
-}
+BLOCKED: set[str] = set()  # all 10 branch contexts verified live 2026-08-06
 CONNECTOR_VERSION = "1.0.0"  # our deployed scraper/connector version string
 
 _ML_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|l)\b", re.I)
