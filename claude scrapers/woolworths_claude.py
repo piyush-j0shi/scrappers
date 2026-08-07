@@ -474,6 +474,7 @@ class WoolworthsClaudeScraper:
         self.auto_bootstrap = auto_bootstrap
         self.max_session_age_min = max_session_age_min
         self.fast_categories: bool = False
+        self.no_details: bool = False  # skip the per-product rich-card detail fetch
         self._detail_cache = get_ww_detail_cache()  # shared static rich-card cache
         self._playwright = None
         self._browser: Optional[Browser] = None
@@ -1369,7 +1370,8 @@ class WoolworthsClaudeScraper:
             # network). All promo data comes from the listing sweep; promo dates
             # are not fetched at all and stay null.
             if all_products:
-                await self.fetch_details(all_products)
+                if not self.no_details:
+                    await self.fetch_details(all_products)
                 self.attach_cached_details(all_products)
 
             # --- DATABASE WRITES DISABLED (two-stage contract) ---
@@ -1865,6 +1867,11 @@ def parse_args() -> argparse.Namespace:
                     help="After the first category captures the API template, skip browser "
                          "navigation for all remaining categories and call the API directly. "
                          "~4-5x faster per branch.")
+    ap.add_argument("--no-details", action="store_true",
+                    help="Skip the per-product rich-card detail fetch (nutrition/allergens/"
+                         "breadcrumb only). Listing data — name, price, size, promo, barcode, "
+                         "image, category — is unaffected. Big speedup for full-branch scrapes "
+                         "when the local detail cache is cold.")
     return ap.parse_args()
 
 
@@ -1957,6 +1964,7 @@ async def main_async() -> int:
                 max_session_age_min=args.max_session_age,
             )
             scraper.fast_categories = args.fast_categories
+            scraper.no_details = args.no_details
             try:
                 stats = await scraper.run()
                 overall["branches"] += 1

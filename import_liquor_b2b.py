@@ -70,6 +70,17 @@ def dollars(cents) -> Optional[float]:
     return round(cents / 100, 2) if isinstance(cents, (int, float)) else None
 
 
+def is_gtin(v: str) -> bool:
+    """True if v is a checksum-valid GTIN-8/12/13/14 (so we only emit real barcodes,
+    not Liquorland's 6-digit internal codes — audit 8 Aug §7)."""
+    if not v or not v.isdigit() or len(v) not in (8, 12, 13, 14):
+        return False
+    ds = [int(c) for c in v]
+    body = ds[:-1][::-1]
+    s = sum(d * (3 if i % 2 == 0 else 1) for i, d in enumerate(body))
+    return (10 - s % 10) % 10 == ds[-1]
+
+
 def unit_volume_ml(size_text: Optional[str]) -> Optional[float]:
     if not size_text:
         return None
@@ -98,10 +109,16 @@ def to_observation(r: dict) -> dict:
     price = dollars(r.get("current_price_cents"))
     compare = dollars(r.get("comparison_price_cents"))
 
+    # Identifiers: only emit a scannable barcode for checksum-valid GTINs. Zero-pad
+    # eligible 11-digit UPC-A (WW) to GTIN-12; drop non-GTIN internal codes (they stay
+    # as identity via source_product_id/retailer_sku) — audit 8 Aug §7.
     identifiers = []
-    bc = r.get("barcode")
+    bc = str(r.get("barcode") or "").strip()
     if bc:
-        identifiers.append({"type": "barcode", "value": str(bc)})
+        if is_gtin(bc):
+            identifiers.append({"type": "barcode", "value": bc})
+        elif len(bc) == 11 and bc.isdigit() and is_gtin("0" + bc):
+            identifiers.append({"type": "barcode", "value": "0" + bc})
 
     attributes = {}
     for k in _ATTR_KEYS:
@@ -144,27 +161,36 @@ def to_observation(r: dict) -> dict:
 
     # promotion: a special price OR a multibuy (doc §3.3). Ordinary price stays on
     # the offer; the special/multibuy terms go here.
+    # Promotions: the DB processor reads `promotions` (ARRAY) and keys `promotion_type`
+    # / `raw_label` — sending a singular `promotion` object silently dropped all 11,796
+    # promos (audit 8 Aug §6). Emit an array with one entry using the exact contract.
+    src_id = r.get("source_product_id") or r.get("retailer_sku") or ""
     promo = None
     if r.get("multibuy_quantity") and r.get("multibuy_price_cents"):
         promo = {
-            "type": "multibuy",
-            "label": r.get("promo_text"),
+            "source_promotion_key": f"multibuy:{src_id}:{r['multibuy_quantity']}",
+            "promotion_type": "multibuy",
+            "raw_label": r.get("promo_text"),
             "qualifying_quantity": int(r["multibuy_quantity"]),
             "bundle_total": dollars(r["multibuy_price_cents"]),
-        }
-    elif r.get("special") or r.get("promo_type") == "special" or r.get("discount"):
-        promo = {
-            # Liquorland "Everyday Value" carries dates but == shelf price (no markdown);
-            # flagged as a special promotion with the observed price.
-            "type": "special",
-            "label": r.get("promo_text"),
             "starts_at": r.get("promo_starts_at"),
             "ends_at": r.get("promo_ends_at"),
-            "source_promotion_id": r.get("source_promotion_id"),
+        }
+    elif r.get("special") or r.get("promo_type") == "special" or r.get("discount"):
+        # Liquorland "Everyday Value" carries dates but == shelf price (no markdown);
+        # flagged as a special promotion at the observed price.
+        promo = {
+            "source_promotion_key": str(r.get("source_promotion_id") or f"special:{src_id}"),
+            "promotion_type": "special",
+            "raw_label": r.get("promo_text"),
             "single_promotional_price": price,
+            "starts_at": r.get("promo_starts_at"),
+            "ends_at": r.get("promo_ends_at"),
+            "metadata": ({"source_promotion_id": r["source_promotion_id"]}
+                         if r.get("source_promotion_id") else None),
         }
     if promo:
-        obs["promotion"] = {k: v for k, v in promo.items() if v is not None}
+        obs["promotions"] = [{k: v for k, v in promo.items() if v is not None}]
 
     # drop null top-level keys (keep offer/attributes/identifiers as-is)
     return {k: v for k, v in obs.items() if v is not None}
@@ -216,7 +242,7 @@ def _client():
 
 def run_live(sb, worker_id: str, cb: dict, observations: list[dict],
              batch_size: int, complete: bool, process_limit: int = 200) -> None:
-    dedupe = f"liquor-{cb['connector_branch_id']}-{datetime.now(timezone.utc):%Y%m%d}"
+    dedupe = f"liquor-{cb['connector_branch_id']}-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}"
     def rpc(fn, params):
         return sb.rpc(fn, params).execute().data
 
@@ -227,59 +253,86 @@ def run_live(sb, worker_id: str, cb: dict, observations: list[dict],
                     return d[k]
         return d
 
+    target = cb["connector_branch_id"]
     job = rpc("scraper_enqueue_job", {
-        "p_connector_branch_id": cb["connector_branch_id"],
+        "p_connector_branch_id": target,
         "p_mode": "full_catalogue",
-        "p_priority": 5,
+        "p_priority": 9,
         "p_initiating_source": "customer_refresh",
         "p_deduplication_key": dedupe,
         "p_metadata": {},
     })
-    job_id = pick(job, "job_id", "id")
     print(f"  enqueued job -> {job}")
+    job_id = pick(job, "job_id", "id")
 
-    claimed = rpc("scraper_claim_next_job", {"p_worker_id": worker_id})
-    print(f"  claimed -> {claimed}")
-    job_id = pick(claimed, "job_id", "id") or job_id
+    # Acquire ONE running run for OUR branch (no duplicate work per branch). Two job
+    # states are possible:
+    #   * reused job already 'claimed' (e.g. left by a dead worker): scraper_start_run
+    #     works DIRECTLY on job_id — no claim. Fixes the old "reused_existing_job + could
+    #     not claim" wedge that hung the importer.
+    #   * fresh 'queued' job: start_run rejects it ("not claimed"); claim it via the
+    #     GLOBAL scraper_claim_next_job, verifying connector_branch so we never stage into
+    #     another retailer's job (misattribution). Release any mismatch back out.
+    run_id = None
+    try:
+        run = rpc("scraper_start_run", {"p_job_id": job_id, "p_connector_version": CONNECTOR_VERSION})
+        run_id = pick(run, "run_id", "id")
+        print(f"  started run directly on job {job_id} -> {run_id}")
+    except Exception:
+        for _ in range(200):
+            c = rpc("scraper_claim_next_job", {"p_worker_id": worker_id})
+            if not c:
+                break
+            c_cb = c.get("connector_branch_id") if isinstance(c, dict) else None
+            c_id = pick(c, "id", "job_id")
+            if c_cb == target:
+                run = rpc("scraper_start_run", {"p_job_id": c_id, "p_connector_version": CONNECTOR_VERSION})
+                run_id = pick(run, "run_id", "id")
+                print(f"  claimed correct-branch job {c_id} -> run {run_id}")
+                break
+            print(f"  released stale job {c_id} (branch {c_cb} != ours)")
+            try:
+                rr = rpc("scraper_start_run", {"p_job_id": c_id, "p_connector_version": CONNECTOR_VERSION})
+                rpc("scraper_finish_run", {
+                    "p_run_id": pick(rr, "run_id", "id"), "p_status": "failed",
+                    "p_catalogue_complete": False,
+                    "p_observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "p_summary": {"released_stale": True}})
+            except Exception as e:
+                print(f"    (could not release {c_id}: {e})")
+    if not run_id:
+        raise SystemExit(f"could not acquire a run for {cb['branch']} ({target}) — check queue state")
 
-    run = rpc("scraper_start_run", {"p_job_id": job_id, "p_connector_version": CONNECTOR_VERSION})
-    run_id = pick(run, "run_id", "id")
-    print(f"  started run -> {run_id}")
-
+    staged = 0
     for bn, chunk in batched(observations, batch_size):
         res = rpc("scraper_stage_observation_batch", {
             "p_run_id": run_id, "p_batch_number": bn,
             "p_batch_idempotency_key": f"{dedupe}-b{bn}",
             "p_contains_priority_targets": False, "p_items": chunk,
         })
+        staged += (res.get("inserted_or_refreshed") if isinstance(res, dict) else 0) or 0
         print(f"  staged batch {bn}: {len(chunk)} items -> {res}")
 
-    from postgrest.exceptions import APIError
-    plimit = process_limit
-    for _ in range(100000):
-        try:
-            p = rpc("scraper_process_pending_run_items", {"p_run_id": run_id, "p_limit": plimit})
-        except APIError as e:
-            # per-item resolution is heavy; a big p_limit can hit the DB statement
-            # timeout (57014). Back off and keep draining.
-            if ("timeout" in str(e).lower() or "57014" in str(e)) and plimit > 25:
-                plimit = max(25, plimit // 2)
-                print(f"  process timed out -> reducing p_limit to {plimit}")
-                continue
-            raise
-        print(f"  process -> {p}")
-        remaining = p.get("remaining") if isinstance(p, dict) else None
-        if not remaining:
-            break
-
+    # Item processing (scraper_process_pending_run_items) is intentionally NOT called:
+    # processing_status is owned by the DB side. The connector's job is to STAGE
+    # correctly-attributed observations (right connector_branch, corrected barcodes /
+    # promotions / source IDs) and hand the run off. Staging is O(seconds) per branch —
+    # the previous hours-long hangs were the processing loop spinning on rejected items.
+    #
+    # Finish as 'partial' (catalogue_complete=False): the DB refuses to finalise a run
+    # as 'completed' while it still has unprocessed observations ("run still has N
+    # unprocessed observations"), and we deliberately don't process. 'partial' is the
+    # accepted staging-handoff status and leaves the run finalised (no dangling job).
     fin = rpc("scraper_finish_run", {
         "p_run_id": run_id,
-        "p_status": "completed" if complete else "partial",
-        "p_catalogue_complete": bool(complete),
+        "p_status": "partial",
+        "p_catalogue_complete": False,
         "p_observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "p_summary": {"items": len(observations)},
+        "p_summary": {"items": len(observations), "staged": staged,
+                      "note": "staged only; processing owned by DB side"},
     })
-    print(f"  finished run -> {fin}")
+    print(f"  finished run (partial/staged) -> {fin}  "
+          f"(staged {staged}/{len(observations)}; processing left to DB side)")
 
 
 def main(argv=None) -> int:
@@ -318,11 +371,22 @@ def main(argv=None) -> int:
 
         records = load_records(path)
         obs = [to_observation(r) for r in records]
+        # De-dupe by idempotency_key: a product can appear in several categories
+        # (esp. full supermarket branches) → same key. The DB's ON CONFLICT rejects
+        # duplicate constrained values within one batch (error 21000), so collapse
+        # them here (last occurrence wins).
+        _seen: dict = {}
+        for _o in obs:
+            _seen[_o["idempotency_key"]] = _o
+        if len(_seen) != len(obs):
+            print(f"  de-duped {len(obs) - len(_seen)} repeated products (multi-category)")
+        obs = list(_seen.values())
         if args.limit:
             obs = obs[:args.limit]
         priced = sum(1 for o in obs if o["offer"]["single_item_price"] is not None)
-        promos = sum(1 for o in obs if "promotion" in o)
-        multibuy = sum(1 for o in obs if o.get("promotion", {}).get("type") == "multibuy")
+        promos = sum(1 for o in obs if o.get("promotions"))
+        multibuy = sum(1 for o in obs if any(p.get("promotion_type") == "multibuy"
+                                             for p in o.get("promotions", [])))
         barcodes = sum(1 for o in obs if o["identifiers"])
         no_name = sum(1 for o in obs if not o.get("product_name"))
         nbatches = (len(obs) + args.batch_size - 1) // args.batch_size
@@ -333,7 +397,7 @@ def main(argv=None) -> int:
             print(f"  -> connector branch: {cb['branch']}  ({cb['connector_code']} / {cb['connector_branch_id']})")
 
         if args.dry_run:
-            sample = next((o for o in obs if "promotion" in o), obs[0] if obs else None)
+            sample = next((o for o in obs if "promotions" in o), obs[0] if obs else None)
             if sample:
                 print("  --- sample observation ---")
                 print("  " + json.dumps(sample, indent=2, ensure_ascii=False)[:1400].replace("\n", "\n  "))

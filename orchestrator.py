@@ -78,7 +78,7 @@ CHAINS: dict[str, dict] = {
         # WW is Akamai, not Cloudflare — it does NOT use the home CF tunnel.
         # Default here uses the bootstrapped saved sessions. If you scrape WW
         # through rotating proxies, add: "--proxy-file", "proxiesthatwork.txt".
-        "scrape_args": ["--all-branches", "--concurrency", "10"],
+        "scrape_args": ["--all-branches", "--concurrency", "10", "--fast-categories"],
     },
     "pns": {
         "label": "Pak'nSave",
