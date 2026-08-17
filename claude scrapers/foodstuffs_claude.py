@@ -577,6 +577,7 @@ def _capsolver_solve_blocking(target_url: str, domain: str, bind_ua: str) -> tup
     browser context's UA to exactly match. Mismatched UA → CF may reject the cookie.
     """
     import urllib.request
+    import urllib.error
 
     def _post(path: str, payload: dict) -> dict:
         req = urllib.request.Request(
@@ -585,8 +586,22 @@ def _capsolver_solve_blocking(target_url: str, domain: str, bind_ua: str) -> tup
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode())
+        # CapSolver's API intermittently returns a transient HTTP 400/5xx or drops the
+        # connection. Without a retry that exception raises straight up and kills the
+        # whole scraper at the startup solve (the one solve path that is NOT otherwise
+        # retried). Retry a few times with backoff before giving up. HTTPError is a
+        # subclass of URLError, so this catches transport-level 400s too.
+        last_err = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return json.loads(resp.read().decode())
+            except urllib.error.URLError as e:
+                last_err = e
+                code = getattr(e, "code", None)
+                logger.warning(f"[cf] CapSolver {path} failed ({code or e}) — retry {attempt + 1}/4")
+                time.sleep(2 * (attempt + 1))
+        raise last_err
 
     proxy = _capsolver_proxy_str(CAPSOLVER_PROXY)
     logger.info(f"[cf] CapSolver AntiCloudflareTask via proxy {proxy.split(':',1)[0]}:***  bind_ua={bind_ua}")

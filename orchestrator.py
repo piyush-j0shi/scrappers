@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import re
 import signal
 import socket
@@ -55,7 +56,21 @@ IMPORTER = str(BASE / "import_products.py")
 _VENV_PY = BASE / ".venv" / "bin" / "python"
 PYTHON = str(_VENV_PY if _VENV_PY.exists() else sys.executable)
 
-TUNNEL_PROXY = "http://127.0.0.1:8890"  # reverse SSH tunnel -> home proxy (CF)
+# Load .env so CAPSOLVER_PROXY (the Webshare residential proxy) is available here
+# for the browser --proxy passed to the NW/PnS scrapers.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(BASE / ".env")
+except Exception:
+    pass
+
+# Webshare residential proxy — used ONLY for the Cloudflare handshakes (CapSolver
+# solve + browser template capture/token refresh). The bulk api-prod scrape stays
+# proxy-less on the datacenter IP. Same URL as CAPSOLVER_PROXY in .env.
+WEBSHARE_PROXY = os.environ.get("CAPSOLVER_PROXY", "")
+
+# --- OLD home-IP tunnel (bore + reverse SSH) — kept, commented, for fallback ---
+# TUNNEL_PROXY = "http://127.0.0.1:8890"  # reverse SSH tunnel -> home proxy (CF)
 
 # Per-chain config. scrape_args are appended after the script name. Edit these
 # to change concurrency/rate, or to point WW at a proxy file (see WW note).
@@ -67,7 +82,7 @@ CHAINS: dict[str, dict] = {
         "retailer": "new-world",
         "source_system": "newworld_scraper",
         "scrape_args": ["--all-branches", "--concurrency", "10", "--rate", "30",
-                        "--proxy", TUNNEL_PROXY],
+                        "--capsolver", "--proxy", WEBSHARE_PROXY],
     },
     "ww": {
         "label": "Woolworths",
@@ -87,7 +102,7 @@ CHAINS: dict[str, dict] = {
         "retailer": "paknsave",
         "source_system": "paknsave_scraper",
         "scrape_args": ["--all-branches", "--concurrency", "10", "--rate", "30",
-                        "--proxy", TUNNEL_PROXY],
+                        "--capsolver", "--proxy", WEBSHARE_PROXY],
     },
 }
 
@@ -297,9 +312,15 @@ async def run() -> None:
     log(f"gate={ARGS.import_start_min} branches  stable={ARGS.file_stable_sec}s  "
         f"poll={ARGS.poll_sec}s  retries={ARGS.import_retries}")
 
-    if ({"nw", "pns"} & set(active)) and not _tunnel_up():
-        log("WARNING: reverse tunnel 127.0.0.1:8890 is NOT reachable — NW/PnS "
-            "will fail Cloudflare. Bring up the home tunnel (setup_local.sh).")
+    # NW/PnS now solve Cloudflare via CapSolver + the Webshare residential proxy
+    # (CAPSOLVER_PROXY in .env); the old reverse-SSH home tunnel is retired.
+    if ({"nw", "pns"} & set(active)) and not WEBSHARE_PROXY:
+        log("WARNING: CAPSOLVER_PROXY (Webshare residential) is empty in .env — "
+            "NW/PnS will fail Cloudflare. Set it before running.")
+    # --- OLD tunnel gate — kept, commented, for fallback ---
+    # if ({"nw", "pns"} & set(active)) and not _tunnel_up():
+    #     log("WARNING: reverse tunnel 127.0.0.1:8890 is NOT reachable — NW/PnS "
+    #         "will fail Cloudflare. Bring up the home tunnel (setup_local.sh).")
 
     started = {k: asyncio.Event() for k in CHAINS}
     done = {k: asyncio.Event() for k in CHAINS}
