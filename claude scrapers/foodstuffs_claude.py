@@ -578,6 +578,7 @@ def _capsolver_solve_blocking(target_url: str, domain: str, bind_ua: str) -> tup
     """
     import urllib.request
     import urllib.error
+    import http.client
 
     def _post(path: str, payload: dict) -> dict:
         req = urllib.request.Request(
@@ -586,20 +587,22 @@ def _capsolver_solve_blocking(target_url: str, domain: str, bind_ua: str) -> tup
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        # CapSolver's API intermittently returns a transient HTTP 400/5xx or drops the
-        # connection. Without a retry that exception raises straight up and kills the
-        # whole scraper at the startup solve (the one solve path that is NOT otherwise
-        # retried). Retry a few times with backoff before giving up. HTTPError is a
-        # subclass of URLError, so this catches transport-level 400s too.
+        # CapSolver's API intermittently returns a transient HTTP 400/5xx, drops the
+        # connection (RemoteDisconnected), or times out. Any of these raises straight up
+        # and kills the whole scraper (the startup solve is not otherwise retried). Retry
+        # a few times with backoff. We catch URLError/HTTPError (transport-level 400s),
+        # OSError (connection resets/timeouts) and http.client.HTTPException
+        # (RemoteDisconnected/BadStatusLine) — the full set of transient network faults.
+        # Note: a fresh Request object is built per call, so re-issuing it is safe.
         last_err = None
         for attempt in range(4):
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     return json.loads(resp.read().decode())
-            except urllib.error.URLError as e:
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
                 last_err = e
                 code = getattr(e, "code", None)
-                logger.warning(f"[cf] CapSolver {path} failed ({code or e}) — retry {attempt + 1}/4")
+                logger.warning(f"[cf] CapSolver {path} failed ({code or type(e).__name__}: {e}) — retry {attempt + 1}/4")
                 time.sleep(2 * (attempt + 1))
         raise last_err
 
@@ -1640,29 +1643,47 @@ class FoodstuffsScraper:
         """A category query that lands on exactly ALGOLIA_PAGE_CAP pages means Algolia
         stopped paginating at its 1000-hit ceiling — the same limit the live website
         hits. If the category0SI facet counts sum to more than 1000, the remainder is
-        invisible to plain pagination but reachable by adding a category1SI filter
+        invisible to plain pagination but reachable by adding a category1NI filter
         (Algolia scopes each facet count independently of the pagination cap)."""
-        facets = (page0_response.get("facets") or {}).get("category1SI") or {}
-        asr_facets = ((page0_response.get("algoliaSearchResult") or {}).get("facets") or {}).get("category1SI") or {}
+        # Foodstuffs returns the subcategory facet as `category1NI` (display names), NOT
+        # `category1SI`. The old code read `category1SI` here → always empty → the split
+        # never ran and every capped category silently stayed at the 1000 cap (or 0 when
+        # the dead-path crash hit). Read category1NI, fall back to category1SI just in case.
+        def _subcat_facet(src: dict) -> dict:
+            f = (src.get("facets") or {})
+            return f.get("category1NI") or f.get("category1SI") or {}
+        facets = _subcat_facet(page0_response)
+        asr_facets = _subcat_facet(page0_response.get("algoliaSearchResult") or {})
         if not facets and asr_facets:
             facets = asr_facets
         if not facets:
             import json as _json
-            dbg_path = Path("/tmp/claude-1000/-home-boiledpotato-Downloads-scrapers/fba76523-0f9e-44bf-ba9f-4edf5db328bd/scratchpad/page0_debug.json")
             asr = page0_response.get("algoliaSearchResult") or {}
             summary = {
                 "totalHits": page0_response.get("totalHits"),
                 "totalPages": page0_response.get("totalPages"),
                 "hitsPerPage": page0_response.get("hitsPerPage"),
                 "top_keys": list(page0_response.keys()),
-                "algoliaSearchResult_keys": list(asr.keys()) if isinstance(asr, dict) else str(type(asr)),
-                "algoliaSearchResult_no_hits": {k: v for k, v in asr.items() if k != "hits"} if isinstance(asr, dict) else None,
+                "top_facets_keys": list((page0_response.get("facets") or {}).keys()),
+                "asr_keys": list(asr.keys()) if isinstance(asr, dict) else str(type(asr)),
+                "asr_facets_keys": list((asr.get("facets") or {}).keys()) if isinstance(asr, dict) else [],
+                "asr_no_hits": {k: v for k, v in asr.items() if k != "hits"} if isinstance(asr, dict) else None,
             }
-            dbg_path.write_text(_json.dumps(summary, indent=2, default=str))
+            # Write to a path that actually exists (the old hardcoded /tmp/claude-1000/...
+            # Linux-dev path did not, so write_text raised FileNotFoundError and crashed the
+            # whole category → 0 products). Wrapped so a dump failure can NEVER drop the category.
+            dbg_path = "(skipped)"
+            try:
+                dbg_dir = Path("/tmp/nw_capped_debug")
+                dbg_dir.mkdir(parents=True, exist_ok=True)
+                dbg_path = dbg_dir / f"{category}_page0_debug.json"
+                dbg_path.write_text(_json.dumps(summary, indent=2, default=str))
+            except Exception as _e:
+                dbg_path = f"(debug dump skipped: {_e})"
             logger.warning(
                 f"  [direct] {url} → capped at {ALGOLIA_PAGE_CAP * 50} hits, "
-                f"no category1SI facet to split by — some products may be missing "
-                f"(debug dump: {dbg_path}, totalHits={page0_response.get('totalHits')})"
+                f"no category1NI facet to split by — some products may be missing "
+                f"(debug: {dbg_path}, totalHits={page0_response.get('totalHits')})"
             )
             return []
 
@@ -1672,10 +1693,10 @@ class FoodstuffsScraper:
             if not count:
                 continue
             sub_products = await self._fetch_filtered_category(
-                url, base_body, base_filters, "category1SI", subcat, category
+                url, base_body, base_filters, "category1NI", subcat, category
             )
             if len(sub_products) < count:
-                # category1SI is multi-valued (a product can sit in >1 bucket), so this
+                # category1NI is multi-valued (a product can sit in >1 bucket), so this
                 # is NOT double-counted against `count` — a real shortfall here means a
                 # page in this bucket failed mid-pagination (see the warnings below).
                 logger.warning(f"  [direct] {url} bucket '{subcat}': got {len(sub_products)}/{count} — possible shortfall of {count - len(sub_products)}")
@@ -1686,7 +1707,7 @@ class FoodstuffsScraper:
         if recovered:
             logger.info(
                 f"  [direct] {url} → recovered {len(recovered)} additional products "
-                f"beyond the 1000-hit cap via category1SI split"
+                f"beyond the 1000-hit cap via category1NI split"
             )
         return recovered
 

@@ -81,7 +81,7 @@ CHAINS: dict[str, dict] = {
         "prefix": "newworld",
         "retailer": "new-world",
         "source_system": "newworld_scraper",
-        "scrape_args": ["--all-branches", "--concurrency", "10", "--rate", "30",
+        "scrape_args": ["--all-branches", "--concurrency", "12", "--rate", "40",
                         "--capsolver", "--proxy", WEBSHARE_PROXY],
     },
     "ww": {
@@ -93,7 +93,7 @@ CHAINS: dict[str, dict] = {
         # WW is Akamai, not Cloudflare — it does NOT use the home CF tunnel.
         # Default here uses the bootstrapped saved sessions. If you scrape WW
         # through rotating proxies, add: "--proxy-file", "proxiesthatwork.txt".
-        "scrape_args": ["--all-branches", "--concurrency", "10", "--fast-categories"],
+        "scrape_args": ["--all-branches", "--concurrency", "12", "--fast-categories"],
     },
     "pns": {
         "label": "Pak'nSave",
@@ -101,7 +101,7 @@ CHAINS: dict[str, dict] = {
         "prefix": "paknsave",
         "retailer": "paknsave",
         "source_system": "paknsave_scraper",
-        "scrape_args": ["--all-branches", "--concurrency", "10", "--rate", "30",
+        "scrape_args": ["--all-branches", "--concurrency", "12", "--rate", "40",
                         "--capsolver", "--proxy", WEBSHARE_PROXY],
     },
 }
