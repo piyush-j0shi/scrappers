@@ -1,47 +1,51 @@
 #!/usr/bin/env python3
-"""Daily pipeline orchestrator — scrape + import, interleaved.
+"""B2B (liquor) pipeline orchestrator — scrape + import, interleaved.
 
-Flow (as designed with the user):
-  Phase 1: launch New World and Woolworths scrapers in PARALLEL.
-  Ongoing: as each chain's completed branch files land on disk and go stable,
-           import them one-by-one — so import runs alongside the still-running
-           scrape. A chain's import is gated shut until it has at least
-           --import-start-min completed branches (default 5).
-  Phase 2: the moment the NW scraper exits, launch the Pak'nSave scraper (+ its
-           own interleaved import loop).
-  Done:    when every scraper has exited AND every landed file is imported.
+Sibling of orchestrator.py, but for the pico-B2B liquor pipeline instead of the
+pico-prod supermarket one. Same shape (parallel scrape + interleaved per-chain
+import loop, graceful SIGINT/SIGTERM, a compact progress line, per-chain logs),
+adapted to three differences:
 
-Why this shape is safe/fast (established earlier):
-  - Cross-retailer imports run concurrently — they touch disjoint retailer rows,
-    which is proven safe and faster. Within one chain, files import sequentially
-    (one at a time) to avoid same-store contention on retailer_products.
-  - The importer's product-matching (barcode -> canonical/variant, name+size
-    fallback, review queue) runs automatically per file — no extra step.
+  1. Scrapers are the LIQUOR scrapers — Liquorland, Super Liquor, The Bottle-O.
+     They are plain HTTP (no Cloudflare/Akamai), so there is NO CapSolver, NO
+     residential proxy, and NO tunnel here. Each scraper, run with no --branch,
+     scrapes ALL of its branches and writes one JSONL per branch to exports/.
+  2. The importer is import_liquor_b2b.py, which resolves each export file to its
+     connector branch itself (via its READY map keyed on the {prefix}_{slug}
+     filename) and stages observations into pico-B2B over RPC. So the import
+     command needs only --input <file> plus --live (real) or --dry-run.
+  3. All three chains run FULLY IN PARALLEL — there is no NW->PnS style phasing;
+     liquor catalogues are small and independent.
+
+Flow:
+  - Launch Liquorland + Super Liquor + The Bottle-O scrapers in parallel.
+  - As each chain's branch files land and go stable, import them one-by-one via
+    import_liquor_b2b.py (per-chain sequential; chains import concurrently).
+  - Done when every scraper has exited AND every landed file is imported.
 
 Where it runs:
-  ON THE SERVER, from the repo root (~/scrapers). The NW/PnS scrapers reach
-  Cloudflare through the home tunnel (reverse SSH :8890, brought up by
-  setup_local.sh on the home box); WW uses its own proxy/session path. The
-  importer talks to pico-prod directly. Nothing here needs the home box beyond
-  that tunnel staying up for NW/PnS.
+  ON THE SERVER, from the repo root (~/scrapers). The importer talks to pico-B2B
+  directly (service-role creds in .env). Nothing here needs the home box.
+
+  NOTE: three supermarket-ALCOHOL connector branches (New World Hobsonville,
+  Woolworths Hobsonville / Glenfield) are ALSO part of pico-B2B, but their data
+  comes from the main supermarket run's exports — feed those to import_liquor_b2b.py
+  separately; this orchestrator owns the three dedicated liquor chains.
 
 Usage:
-  python orchestrator.py                     # full run: NW+WW then PnS, with imports
-  python orchestrator.py --skip ww           # drop a chain
-  python orchestrator.py --no-import         # scrape only
-  python orchestrator.py --dry-run-import    # scrape for real, imports parse-only (no DB writes)
-  python orchestrator.py --import-start-min 1 --poll-sec 20   # tune gating/cadence
+  python b2b_orchestrator.py                    # full run: all 3 liquor chains + import (--live)
+  python b2b_orchestrator.py --skip bo          # drop a chain
+  python b2b_orchestrator.py --no-import         # scrape only
+  python b2b_orchestrator.py --dry-run-import    # scrape for real, imports parse-only (no B2B writes)
 
-Logs: orchestrator_logs/{orchestrator,<chain>_scrape,<chain>_import}.log
+Logs: b2b_orchestrator_logs/{b2b_orchestrator,<chain>_scrape,<chain>_import}.log
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import re
 import signal
-import socket
 import sys
 import time
 from datetime import datetime, timezone
@@ -51,58 +55,32 @@ from typing import Optional
 BASE = Path(__file__).resolve().parent
 SCRAPERS_DIR = BASE / "claude scrapers"
 EXPORTS_DIR = BASE / "exports"
-LOG_DIR = BASE / "orchestrator_logs"
-IMPORTER = str(BASE / "import_products.py")
+LOG_DIR = BASE / "b2b_orchestrator_logs"
+IMPORTER = str(BASE / "import_liquor_b2b.py")
 _VENV_PY = BASE / ".venv" / "bin" / "python"
 PYTHON = str(_VENV_PY if _VENV_PY.exists() else sys.executable)
 
-# Load .env so CAPSOLVER_PROXY (the Webshare residential proxy) is available here
-# for the browser --proxy passed to the NW/PnS scrapers.
-try:
-    from dotenv import load_dotenv
-    load_dotenv(BASE / ".env")
-except Exception:
-    pass
-
-# Webshare residential proxy — used ONLY for the Cloudflare handshakes (CapSolver
-# solve + browser template capture/token refresh). The bulk api-prod scrape stays
-# proxy-less on the datacenter IP. Same URL as CAPSOLVER_PROXY in .env.
-WEBSHARE_PROXY = os.environ.get("CAPSOLVER_PROXY", "")
-
-# --- OLD home-IP tunnel (bore + reverse SSH) — kept, commented, for fallback ---
-# TUNNEL_PROXY = "http://127.0.0.1:8890"  # reverse SSH tunnel -> home proxy (CF)
-
-# Per-chain config. scrape_args are appended after the script name. Edit these
-# to change concurrency/rate, or to point WW at a proxy file (see WW note).
+# Per-chain config. scrape_args are appended after the script name. Each liquor
+# scraper scrapes ALL its branches when run with no --branch, so scrape_args are
+# empty by default; add --limit / --categories here for a quick test run.
 CHAINS: dict[str, dict] = {
-    "nw": {
-        "label": "New World",
-        "script": "newworld_claude.py",
-        "prefix": "newworld",
-        "retailer": "new-world",
-        "source_system": "newworld_scraper",
-        "scrape_args": ["--all-branches", "--concurrency", "12", "--rate", "40",
-                        "--capsolver", "--proxy", WEBSHARE_PROXY],
+    "ll": {
+        "label": "Liquorland",
+        "script": "liquorland_claude.py",
+        "prefix": "liquorland",
+        "scrape_args": [],
     },
-    "ww": {
-        "label": "Woolworths",
-        "script": "woolworths_claude.py",
-        "prefix": "woolworths",
-        "retailer": "woolworths",
-        "source_system": "woolworths_scraper",
-        # WW is Akamai, not Cloudflare — it does NOT use the home CF tunnel.
-        # Default here uses the bootstrapped saved sessions. If you scrape WW
-        # through rotating proxies, add: "--proxy-file", "proxiesthatwork.txt".
-        "scrape_args": ["--all-branches", "--concurrency", "8", "--fast-categories"],
+    "sl": {
+        "label": "Super Liquor",
+        "script": "superliquor_claude.py",
+        "prefix": "superliquor",
+        "scrape_args": [],
     },
-    "pns": {
-        "label": "Pak'nSave",
-        "script": "paknsave_claude.py",
-        "prefix": "paknsave",
-        "retailer": "paknsave",
-        "source_system": "paknsave_scraper",
-        "scrape_args": ["--all-branches", "--concurrency", "12", "--rate", "40",
-                        "--capsolver", "--proxy", WEBSHARE_PROXY],
+    "bo": {
+        "label": "The Bottle-O",
+        "script": "thebottleo_glenfield_claude.py",
+        "prefix": "thebottleo",
+        "scrape_args": [],
     },
 }
 
@@ -118,20 +96,10 @@ def log(msg: str) -> None:
     line = f"[{datetime.now(timezone.utc):%H:%M:%S}] {msg}"
     print(line, flush=True)
     try:
-        with (LOG_DIR / "orchestrator.log").open("a") as f:
+        with (LOG_DIR / "b2b_orchestrator.log").open("a") as f:
             f.write(line + "\n")
     except OSError:
         pass
-
-
-def _norm_slug(key: str, slug: str) -> str:
-    """Defensive Pak'nSave normalization: old export files used the `pak-nsave-`
-    branch slug, but the pico-prod branch slug is `paknsave-`. Current scrapers
-    already emit `paknsave-` (apostrophe dropped), so this is a no-op for them —
-    it only rescues an older-style filename if the server's scraper copy lags."""
-    if key == "pns" and slug.startswith("pak-nsave-"):
-        return "paknsave-" + slug[len("pak-nsave-"):]
-    return slug
 
 
 def _slug_from(prefix: str, fname: str) -> Optional[str]:
@@ -181,12 +149,11 @@ async def run_scraper(key: str) -> int:
 
 
 async def import_one(key: str, path: Path, slug: str) -> int:
-    c = CHAINS[key]
-    cmd = [PYTHON, IMPORTER, "--input", str(path),
-           "--retailer", c["retailer"], "--source-system", c["source_system"],
-           "--branch-slug", slug, "--full-branch"]
-    if ARGS.dry_run_import:
-        cmd.append("--dry-run")
+    # import_liquor_b2b.py resolves the connector branch itself from the filename
+    # (its READY map), so we only pass --input plus the live/dry-run switch. The
+    # importer defaults to --dry-run, so a real run must pass --live explicitly.
+    cmd = [PYTHON, IMPORTER, "--input", str(path)]
+    cmd.append("--dry-run" if ARGS.dry_run_import else "--live")
     with (LOG_DIR / f"{key}_import.log").open("a") as logf:
         logf.write(f"\n=== import {path.name} (slug={slug}) "
                    f"{datetime.now(timezone.utc):%H:%M:%SZ} ===\n")
@@ -200,9 +167,9 @@ async def import_loop(key: str, scraper_started: asyncio.Event,
     until the scraper is done and every file has been imported.
 
     Two-stage start: (1) wait for this chain's scraper to actually launch, then
-    hold for --import-warmup-sec (default 5 min) so the scraper has time to land
-    its first branches before we even look; (2) open the gate once at least
-    --import-start-min branches are on disk (or the scraper has already exited)."""
+    hold for --import-warmup-sec so the scraper lands its first branch(es);
+    (2) open the gate once at least --import-start-min branches are on disk (or
+    the scraper has already exited)."""
     c = CHAINS[key]
     prefix = c["prefix"]
     imported: set[str] = set()   # filenames done (incl. given-up failures)
@@ -237,7 +204,6 @@ async def import_loop(key: str, scraper_started: asyncio.Event,
                 log(f"[{key}] SKIP unparseable filename: {p.name}")
                 imported.add(p.name)
                 continue
-            slug = _norm_slug(key, slug)
             rc = await import_one(key, p, slug)
             if rc == 0:
                 imported.add(p.name)
@@ -267,14 +233,6 @@ async def import_loop(key: str, scraper_started: asyncio.Event,
         await asyncio.sleep(ARGS.poll_sec)
 
 
-def _tunnel_up(port: int = 8890) -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=3):
-            return True
-    except OSError:
-        return False
-
-
 async def progress_reporter() -> None:
     """Print one compact status line every --progress-sec so the run is watchable
     right in the terminal, without tailing the per-chain log files."""
@@ -301,26 +259,16 @@ async def run() -> None:
     global ACTIVE, STATS, _WORK
     LOG_DIR.mkdir(exist_ok=True)
     EXPORTS_DIR.mkdir(exist_ok=True)
-    ACTIVE = [k for k in ("nw", "ww", "pns") if k not in ARGS.skip]
+    ACTIVE = [k for k in ("ll", "sl", "bo") if k not in ARGS.skip]
     STATS = {k: {"scraper": "pending", "imported": 0, "failed": 0} for k in ACTIVE}
     active = ACTIVE
 
-    log("================ ORCHESTRATOR START ================")
+    log("================ B2B ORCHESTRATOR START ================")
     log(f"chains: {', '.join(CHAINS[k]['label'] for k in active)}"
         f"{'  (import DISABLED)' if ARGS.no_import else ''}"
-        f"{'  (import DRY-RUN)' if ARGS.dry_run_import else ''}")
+        f"{'  (import DRY-RUN)' if ARGS.dry_run_import else '  (import LIVE -> pico-B2B)'}")
     log(f"gate={ARGS.import_start_min} branches  stable={ARGS.file_stable_sec}s  "
         f"poll={ARGS.poll_sec}s  retries={ARGS.import_retries}")
-
-    # NW/PnS now solve Cloudflare via CapSolver + the Webshare residential proxy
-    # (CAPSOLVER_PROXY in .env); the old reverse-SSH home tunnel is retired.
-    if ({"nw", "pns"} & set(active)) and not WEBSHARE_PROXY:
-        log("WARNING: CAPSOLVER_PROXY (Webshare residential) is empty in .env — "
-            "NW/PnS will fail Cloudflare. Set it before running.")
-    # --- OLD tunnel gate — kept, commented, for fallback ---
-    # if ({"nw", "pns"} & set(active)) and not _tunnel_up():
-    #     log("WARNING: reverse tunnel 127.0.0.1:8890 is NOT reachable — NW/PnS "
-    #         "will fail Cloudflare. Bring up the home tunnel (setup_local.sh).")
 
     started = {k: asyncio.Event() for k in CHAINS}
     done = {k: asyncio.Event() for k in CHAINS}
@@ -338,31 +286,20 @@ async def run() -> None:
         finally:
             done[key].set()
 
-    # Phase 1 — NW + WW together.
-    for key in ("nw", "ww"):
+    # All liquor chains run in parallel — no phasing.
+    for key in ("ll", "sl", "bo"):
         if key in active:
             tasks.append(asyncio.create_task(scrape_then_signal(key)))
             if not ARGS.no_import:
                 tasks.append(asyncio.create_task(import_loop(key, started[key], done[key])))
 
-    # Phase 2 — PnS after the NW scraper exits.
-    if "pns" in active:
-        async def pns_after_nw() -> None:
-            if "nw" in active:
-                await done["nw"].wait()
-                log("[pns] NW scraping finished — starting Pak'nSave")
-            await scrape_then_signal("pns")
-        tasks.append(asyncio.create_task(pns_after_nw()))
-        if not ARGS.no_import:
-            tasks.append(asyncio.create_task(import_loop("pns", started["pns"], done["pns"])))
-
     prog = asyncio.create_task(progress_reporter())
     _WORK = asyncio.gather(*tasks)
     try:
         await _WORK
-        log("================ PIPELINE COMPLETE ================")
+        log("================ B2B PIPELINE COMPLETE ================")
     except asyncio.CancelledError:
-        log("================ ORCHESTRATOR STOPPED (signal) ================")
+        log("================ B2B ORCHESTRATOR STOPPED (signal) ================")
     finally:
         prog.cancel()
 
@@ -379,16 +316,18 @@ def main() -> int:
     global ARGS, RUN_START
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--skip", nargs="*", default=[], choices=["nw", "ww", "pns"],
-                    help="chains to skip")
+    ap.add_argument("--skip", nargs="*", default=[], choices=["ll", "sl", "bo"],
+                    help="chains to skip (ll=Liquorland, sl=Super Liquor, bo=The Bottle-O)")
     ap.add_argument("--no-import", action="store_true", help="scrape only, no imports")
     ap.add_argument("--dry-run-import", action="store_true",
-                    help="run importers in --dry-run (parse-only, no DB writes)")
-    ap.add_argument("--import-warmup-sec", type=int, default=300,
+                    help="run importer in --dry-run (parse-only, no B2B writes); "
+                         "default is --live (stages into pico-B2B)")
+    ap.add_argument("--import-warmup-sec", type=int, default=60,
                     help="wait this long after a chain's scraper starts before "
-                         "importing anything (default 300 = 5 min)")
-    ap.add_argument("--import-start-min", type=int, default=5,
-                    help="branches on disk before a chain's import gate opens")
+                         "importing (default 60; liquor catalogues are small)")
+    ap.add_argument("--import-start-min", type=int, default=1,
+                    help="branches on disk before a chain's import gate opens "
+                         "(default 1; few liquor branches per chain)")
     ap.add_argument("--file-stable-sec", type=int, default=60,
                     help="a file must be untouched this long before it's imported")
     ap.add_argument("--poll-sec", type=int, default=30, help="watch/import poll interval")
